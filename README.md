@@ -1,24 +1,22 @@
 # exkururuIPROS NGIPS
 
-[English README](README.en.md)
-[4-stack demo note](README.4stack.md)
+[英語版 README](README.en.md)  
+[4製品デモ概要](README.4stack.md)
 
-EXkururuIPROS is a public-distribution-focused NGIPS/NDR component for low-resource environments.
-This repository keeps the product surface that is useful to evaluate publicly: dashboard UI, sensor layout,
-event ingest, alert workflow, and local development entry points.
+EXkururuIPROS は、低リソース環境向けに設計した公開配布用の NGIPS/NDR コンポーネントです。  
+この公開リポジトリでは、ダッシュボード UI、センサー構成、イベント投入、アラート運用、ローカル起動導線といった「評価しやすい面」を残しています。
 
-## Public scope
+## 公開範囲
 
-- Lightweight dashboard and API
-- Rust sensor layout for edge enforcement
-- Event ingest and incident-oriented workflow
-- Threat-intel integration surface
-- Local development and demo startup
+- 軽量ダッシュボードと API
+- エッジ適用向け Rust センサー構成
+- イベント投入とインシデント指向ワークフロー
+- 脅威インテリジェンス連携の表面
+- ローカル開発とデモ起動導線
 
-Implementation details that directly encode production tuning, scoring, rollout strategy, and operational
-thresholds are intentionally excluded from the public distribution.
+本番の閾値、スコアリング、ロールアウト戦略、運用チューニング値のような核心部分は公開版から除外しています。
 
-## Architecture
+## アーキテクチャ
 
 ```text
 Internet
@@ -34,15 +32,15 @@ Incident Engine
 Dashboard
 ```
 
-## Capabilities
+## 主な機能
 
-- Multi-sensor operation
-- Alert aggregation
-- Threat-intel enrichment surface
-- SOC/XDR/EDR integration panel
-- Lightweight flow-oriented network detection
+- マルチセンサー運用
+- アラート集約
+- 脅威インテリジェンス付与の受け口
+- SOC / XDR / EDR の統合表示パネル
+- 軽量なフロー指向ネットワーク検知
 
-## Quick Start
+## クイックスタート
 
 ```bash
 cd /path/to/exkururuIPROS
@@ -52,11 +50,10 @@ cp .env.example .env
 IPS_ADMIN_TOKEN=change-this-admin-token IPS_DB_PATH=./ips_open.db ./.venv/bin/uvicorn dashboard.app:app --host 127.0.0.1 --port 8787
 ```
 
-## Environment
+## 公開している環境変数
 
-Public examples intentionally expose only minimum bootstrap variables.
-Production thresholds, exclusion lists, rollout defaults, and environment-specific integration values should
-be managed outside the public repository.
+公開版では最小限の起動変数だけを例示しています。  
+本番用の閾値、除外条件、ロールアウト既定値、環境固有の連携設定は公開リポジトリ外で管理する前提です。
 
 - `IPS_DB_PATH`
 - `IPS_ADMIN_TOKEN`
@@ -64,20 +61,19 @@ be managed outside the public repository.
 - `IPS_BIND_PORT`
 - `IPS_DEFAULT_WORKSPACE`
 
-## Integration
+## 統合連携
 
-The dashboard can present a live integration panel for adjacent products such as XDR, SOC, and EDR.
-Only the integration surface is documented in public; environment-specific endpoints and credentials should
-be supplied privately.
+ダッシュボードは XDR、SOC、EDR といった隣接プロダクトの統合パネルを表示できます。  
+公開版では「連携面の存在」だけを示し、接続先や認証情報のような実運用設定は含めていません。
 
-## Security
+## セキュリティ方針
 
-- Keep secrets out of the repository.
-- Bind local services to trusted interfaces only.
-- Put the dashboard behind TLS termination and authenticated reverse proxying in shared environments.
-- Treat public sample settings as development defaults only.
+- 秘密情報はリポジトリに含めない
+- ローカルサービスは信頼できるインターフェースへ bind する
+- 共用環境では TLS 終端と認証付きリバースプロキシの背後で使う
+- 公開サンプル設定は開発用既定値として扱う
 
-## License
+## ライセンス
 
-This repository uses `Personal Developer License v1.0`.
-See [LICENSE](LICENSE).
+このリポジトリは `Personal Developer License v1.0` を採用しています。  
+詳細は [LICENSE](LICENSE) を参照してください。

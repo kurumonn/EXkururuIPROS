@@ -1,13 +1,12 @@
-# 4-Stack Demo Note
+# 4製品デモ概要
 
-This repository supports the EXkururu 4-stack demo flow with EDR, IPROS, XDR, and SOC.
+このリポジトリは、EDR / IPROS / XDR / SOC で構成する EXkururu 4製品デモに参加します。
 
-The public repository keeps only the demo entry point and high-level value statement:
+公開リポジトリでは、デモの入口と高レベルな価値だけを示しています。
 
-1. EDR produces endpoint signals
-2. IPROS produces network signals
-3. XDR correlates signals into incidents
-4. SOC reviews and rolls out decisions
+1. EDR が端末シグナルを生成する
+2. IPROS がネットワークシグナルを生成する
+3. XDR がそれらを相関してインシデント化する
+4. SOC が判断し、ロールアウトを管理する
 
-Exact demo wiring, environment-specific endpoints, source bootstrap details, and rollout payloads are kept
-outside the public repository.
+具体的な接続先、起動順序、source bootstrap の詳細、ロールアウト用ペイロードは公開リポジトリ外で扱います。
