@@ -1,0 +1,47 @@
+name: kururuIPROS CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+jobs:
+  dashboard-python:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dashboard deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r dashboard/requirements.txt
+
+      - name: Python syntax check
+        run: |
+          python -m py_compile dashboard/app.py dashboard/storage.py dashboard/parser.py dashboard/security.py dashboard/notifier.py
+
+      - name: Shell scripts lint
+        run: |
+          bash -n scripts/load_test_api.sh
+          bash -n scripts/failure_injection_check.sh
+
+  sensor-rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sensor
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo check
+        run: cargo check

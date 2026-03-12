@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>exkururuIPROS NGIPS</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #08111d;
+      --bg2: #10203a;
+      --card: rgba(10, 18, 31, 0.9);
+      --line: #223452;
+      --text: #e5edf9;
+      --muted: #c2d1e9;
+      --accent: #75b6ff;
+      --ok: #34d399;
+      --warn: #f59e0b;
+      --danger: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--text);
+      font-family: "Noto Sans JP", sans-serif;
+      background: radial-gradient(circle at top, var(--bg2), var(--bg) 50%);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+    .wrap { width: min(1360px, 100%); max-width: 1360px; margin: 0 auto; padding: 18px; overflow-x: hidden; }
+    .topbar { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:16px; }
+    .title { font-size: 1.4rem; font-weight: 800; }
+    .sub { color: var(--muted); font-size: 0.85rem; }
+    .grid-kpi { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:14px; }
+    .kpi, .card {
+      background: linear-gradient(180deg, rgba(16,32,58,0.78), rgba(7,14,25,0.9));
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.22);
+    }
+    .kpi { padding: 16px; }
+    .kpi .label { color: var(--muted); font-size: 0.8rem; margin-bottom: 5px; }
+    .kpi .value { font-size: 1.7rem; font-weight: 800; line-height: 1.1; }
+    .kpi .value.mode {
+      font-size: clamp(0.96rem, 1.15vw, 1.2rem);
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .layout { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .card { padding: 14px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .card.full { grid-column: 1 / -1; }
+    h2 { margin: 0 0 10px; font-size: 0.92rem; color: var(--accent); }
+    table { width:100%; border-collapse: collapse; font-size: 0.83rem; }
+    th, td { padding: 7px 8px; border-bottom: 1px solid rgba(34,52,82,0.7); word-break: break-word; overflow-wrap: anywhere; }
+    th { text-align:left; color: var(--muted); font-weight:600; }
+    td.num { text-align:right; font-variant-numeric: tabular-nums; }
+    .empty { color: var(--muted); padding: 24px 8px; text-align:center; }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
+    .toolbar input, .toolbar select, .toolbar button {
+      background: #0f1a2c;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 6px 8px;
+      font-size: 0.8rem;
+    }
+    .toolbar .msg { color: var(--muted); font-size: 0.78rem; }
+    canvas { width:100%; height:220px; display:block; }
+    @media (max-width: 900px) {
+      .layout { grid-template-columns:1fr; }
+      .kpi .value.mode { font-size: 0.95rem; }
+    }
+    @media (max-width: 768px) {
+      :root {
+        --bg: #070f1b;
+        --bg2: #132746;
+        --line: #2e466a;
+        --text: #edf4ff;
+        --muted: #d0dcf1;
+      }
+      .wrap { padding: 10px; }
+      .topbar { gap: 8px; margin-bottom: 10px; }
+      .title { font-size: 1.12rem; }
+      .sub { font-size: 0.78rem; line-height: 1.35; }
+      .grid-kpi { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 10px; }
+      .kpi { padding: 10px; }
+      .kpi .label { font-size: 0.68rem; }
+      .kpi .value { font-size: 1.2rem; }
+      .card { padding: 10px; border-radius: 10px; }
+      h2 { font-size: 0.8rem; }
+      .toolbar { display: grid; grid-template-columns: 1fr; gap: 6px; }
+      .toolbar input, .toolbar select, .toolbar button, .toolbar label {
+        width: 100% !important;
+        min-width: 0 !important;
+        max-width: 100%;
+      }
+      table { display: block; overflow-x: auto; white-space: nowrap; font-size: 0.73rem; }
+      th, td { padding: 6px 7px; }
+      canvas { height: 170px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div>
+        <div class="title">exkururuIPROS NGIPS</div>
+        <div class="sub">公開配布向けに再設計した Next-Gen IPS センサーとダッシュボード</div>
+      </div>
+      <div class="sub" id="lastUpdate">loading...</div>
+    </div>
+    <div class="grid-kpi">
+      <div class="kpi"><div class="label">24h Total Requests</div><div class="value" id="kpiTotal">--</div></div>
+      <div class="kpi"><div class="label">Blocked (429, 24h)</div><div class="value" id="kpiBlocked">--</div></div>
+      <div class="kpi"><div class="label">Block Rate</div><div class="value" id="kpiRate">--</div></div>
+      <div class="kpi"><div class="label">Avg Response Time</div><div class="value" id="kpiRt">--</div></div>
+      <div class="kpi"><div class="label">Edge Enforcement Mode</div><div class="value mode" id="kpiWaf">--</div></div>
+      <div class="kpi"><div class="label">Sensor Scoring Mode</div><div class="value mode" id="kpiSensorMode">--</div></div>
+      <div class="kpi"><div class="label">Effective Response Mode</div><div class="value mode" id="kpiEffectiveMode">--</div></div>
+      <div class="kpi"><div class="label">Webhook Channels</div><div class="value" id="kpiNotify">--</div></div>
+    </div>
+    <div class="layout">
+      <div class="card full">
+        <h2>Test IP Exclusion Ops</h2>
+        <div class="toolbar">
+          <input id="testIpAdminToken" type="password" placeholder="IPS_ADMIN_TOKEN">
+          <input id="testIpActor" type="text" placeholder="actor" value="soc_operator">
+          <label><input id="excludeTestIpToggle" type="checkbox"> exclude_test_ip_on_kpi</label>
+          <button type="button" id="saveExcludeToggleBtn">Save KPI Setting</button>
+          <span class="msg" id="testIpOpsMsg">read-only</span>
+        </div>
+        <div class="toolbar">
+          <input id="testIpValue" type="text" placeholder="IP or CIDR (e.g. 192.0.2.10 or 10.0.0.0/24)">
+          <input id="testIpExpiresAt" type="text" placeholder="expires_at (ISO8601, optional)">
+          <input id="testIpNote" type="text" placeholder="note">
+          <button type="button" id="addTestIpBtn">Add / Update</button>
+          <button type="button" id="refreshTestIpBtn">Refresh</button>
+        </div>
+        <table>
+          <thead><tr><th>ID</th><th>Rule</th><th>Status</th><th>Expires</th><th>Updated</th><th>By</th><th>Note</th><th>Action</th></tr></thead>
+          <tbody id="testIpBody"></tbody>
+        </table>
+        <div class="empty" id="testIpEmpty" hidden>No test IP rules</div>
+      </div>
+      <div class="card full">
+        <h2>Blocked Requests (24h)</h2>
+        <canvas id="chartBlocked" height="220"></canvas>
+      </div>
+      <div class="card">
+        <h2>Top Blocked IPs (48h)</h2>
+        <table><thead><tr><th>IP</th><th class="num">Count</th></tr></thead><tbody id="ipsBody"></tbody></table>
+        <div class="empty" id="ipsEmpty" hidden>No blocked IPs in last 48h</div>
+      </div>
+      <div class="card">
+        <h2>High Activity URIs (24h)</h2>
+        <table><thead><tr><th>URI</th><th class="num">Count</th></tr></thead><tbody id="urisBody"></tbody></table>
+        <div class="empty" id="urisEmpty" hidden>No high-activity URIs in last 24h</div>
+      </div>
+      <div class="card full">
+        <h2>Response Time Trend (p50 / p95 / p99)</h2>
+        <canvas id="chartRt" height="220"></canvas>
+      </div>
+      <div class="card full">
+        <h2>SOC Chain (24h)</h2>
+        <table>
+          <thead><tr><th>Stage</th><th class="num">Count</th><th class="num">Connection Rate</th></tr></thead>
+          <tbody id="socChainBody"></tbody>
+        </table>
+        <div class="empty" id="socChainEmpty" hidden>No SOC chain data in last 24h</div>
+      </div>
+      <div class="card full">
+        <h2>XDR / SOC / EDR Integration Status</h2>
+        <div class="sub" style="margin-bottom:8px;">
+          承認は Incident Triage Queue、XDR 連携確認は下表と Remote Actions で実施
+        </div>
+        <table>
+          <thead><tr><th>Item</th><th class="num">Value</th><th>Note</th></tr></thead>
+          <tbody id="stackStatusBody"></tbody>
+        </table>
+        <div class="empty" id="stackStatusEmpty" hidden>No integration status data</div>
+        <table style="margin-top:12px;">
+          <thead><tr><th>Sensor Type</th><th class="num">Total</th><th class="num">Active</th><th class="num">Healthy (10m)</th></tr></thead>
+          <tbody id="stackSensorHealthBody"></tbody>
+        </table>
+        <div class="empty" id="stackSensorHealthEmpty" hidden>No sensor health data</div>
+        <div class="sub" style="margin-top:12px; margin-bottom:8px;" id="stackLiveSummary">Live panel loading...</div>
+        <table>
+          <thead><tr><th>Service</th><th>Status</th><th class="num">Latency</th><th>Health</th><th>Metrics</th><th>Dashboard</th></tr></thead>
+          <tbody id="stackLiveBody"></tbody>
+        </table>
+        <div class="empty" id="stackLiveEmpty" hidden>No live integration data</div>
+      </div>
+      <div class="card full">
+        <h2>Action Latency SLO Breaches (Recent)</h2>
+        <table>
+          <thead><tr><th>Time</th><th>Action</th><th>Bucket</th><th class="num">p95 ms</th><th class="num">p99 ms</th><th class="num">th p95</th><th class="num">th p99</th></tr></thead>
+          <tbody id="latencyAlertsBody"></tbody>
+        </table>
+        <div class="empty" id="latencyAlertsEmpty" hidden>No SLO breaches</div>
+      </div>
+      <div class="card">
+        <h2>Block Reasons (24h)</h2>
+        <table><thead><tr><th>Reason</th><th class="num">Count</th></tr></thead><tbody id="reasonsBody"></tbody></table>
+        <div class="empty" id="reasonsEmpty" hidden>No block reasons recorded</div>
+      </div>
+      <div class="card">
+        <h2>Detection Rules (24h)</h2>
+        <table><thead><tr><th>Rule</th><th>Severity</th><th class="num">Hits</th></tr></thead><tbody id="rulesBody"></tbody></table>
+        <div class="empty" id="rulesEmpty" hidden>No rule hits in last 24h</div>
+      </div>
+      <div class="card full">
+        <h2>Monitored User-Agents (Rule-based, 24h)</h2>
+        <table><thead><tr><th>User-Agent</th><th class="num">Count</th></tr></thead><tbody id="uasBody"></tbody></table>
+        <div class="empty" id="uasEmpty" hidden>No monitored UAs in last 24h</div>
+      </div>
+      <div class="card full">
+        <h2>Rule Editor UI</h2>
+        <div class="toolbar">
+          <input id="ruleKeyInput" type="text" placeholder="rule key (e.g. scan-003)">
+          <select id="ruleActionInput">
+            <option value="observe">observe</option>
+            <option value="allow">allow</option>
+            <option value="limit">limit</option>
+            <option value="challenge">challenge</option>
+            <option value="block">block</option>
+          </select>
+          <input id="ruleTtlInput" type="number" min="1" max="720" value="24" placeholder="ttl hours">
+          <input id="ruleReasonInput" type="text" placeholder="reason">
+          <button type="button" id="ruleOverrideSaveBtn">Save Override</button>
+          <button type="button" id="ruleFeedbackFpBtn">Feedback FP</button>
+          <button type="button" id="ruleFeedbackTpBtn">Feedback TP</button>
+          <button type="button" id="ruleRefreshBtn">Refresh</button>
+          <span class="msg" id="ruleEditorMsg">admin token required</span>
+        </div>
+        <table>
+          <thead><tr><th>ID</th><th>Rule</th><th>Action</th><th>Reason</th><th>Actor</th><th>Expires</th><th>Updated</th></tr></thead>
+          <tbody id="ruleOverridesBody"></tbody>
+        </table>
+        <div class="empty" id="ruleOverridesEmpty" hidden>No active overrides</div>
+        <table>
+          <thead><tr><th>Rule</th><th class="num">Total</th><th class="num">FP</th><th class="num">TP</th><th class="num">FP Rate</th><th>Last</th></tr></thead>
+          <tbody id="ruleFeedbackBody"></tbody>
+        </table>
+        <div class="empty" id="ruleFeedbackEmpty" hidden>No feedback stats</div>
+      </div>
+      <div class="card">
+        <h2>UA Classification (24h)</h2>
+        <table><thead><tr><th>Class</th><th class="num">Count</th></tr></thead><tbody id="uaClassBody"></tbody></table>
+        <div class="empty" id="uaClassEmpty" hidden>No UA classification data in last 24h</div>
+      </div>
+      <div class="card full">
+        <h2>Incident Triage Queue</h2>
+        <div class="toolbar">
+          <input id="adminToken" type="password" placeholder="IPS_ADMIN_TOKEN (optional)">
+          <input id="adminActor" type="text" placeholder="actor" value="soc_operator">
+          <select id="incidentFilter">
+            <option value="all">all</option>
+            <option value="open">open</option>
+            <option value="triaged">triaged</option>
+            <option value="closed">closed</option>
+          </select>
+          <button type="button" id="incidentRefreshBtn">Refresh</button>
+          <span class="msg" id="incidentMsg">read-only</span>
+        </div>
+        <table>
+          <thead><tr><th>Updated</th><th>Incident</th><th>Severity</th><th>Status</th><th class="num">Events</th><th>Window</th><th>Action</th></tr></thead>
+          <tbody id="incidentsBody"></tbody>
+        </table>
+        <div class="empty" id="incidentsEmpty" hidden>No incidents recorded</div>
+      </div>
+      <div class="card full">
+        <h2>Threat Intel Matches (Evidence)</h2>
+        <table>
+          <thead><tr><th>Time</th><th>Source IP</th><th>Rule</th><th>Provider</th><th class="num">Score</th><th class="num">Confidence</th><th>Detail</th></tr></thead>
+          <tbody id="tiMatchesBody"></tbody>
+        </table>
+        <div class="empty" id="tiMatchesEmpty" hidden>No threat intel matches</div>
+      </div>
+      <div class="card">
+        <h2>Flow Signals (24h)</h2>
+        <table><thead><tr><th>Signal</th><th class="num">Hits</th></tr></thead><tbody id="flowSignalsBody"></tbody></table>
+        <div class="empty" id="flowSignalsEmpty" hidden>No flow signals in last 24h</div>
+      </div>
+      <div class="card full">
+        <h2>Notification Delivery (Recent)</h2>
+        <table><thead><tr><th>Time</th><th>Workspace</th><th>Channel</th><th>Event</th><th>Status</th><th>Detail</th></tr></thead><tbody id="notifyBody"></tbody></table>
+        <div class="empty" id="notifyEmpty" hidden>No notification delivery logs</div>
+      </div>
+    </div>
+  </div>
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>

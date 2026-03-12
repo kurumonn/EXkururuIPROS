@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  dashboard:
+    image: python:3.12-slim
+    working_dir: /app
+    command: >
+      sh -c "pip install -r dashboard/requirements.txt &&
+             uvicorn dashboard.app:app --host 0.0.0.0 --port 8787"
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    ports:
+      - "127.0.0.1:8787:8787"
+
