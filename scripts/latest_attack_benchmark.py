@@ -34,6 +34,9 @@ def _build_events(seed: int = 20260310) -> list[dict]:
         {"name": "search_crawler_verified", "kind": "benign", "count": 140, "signature": "CRAWLER-VERIFIED", "uri": "/trpg/"},
         {"name": "mobile_api_fluctuation", "kind": "benign", "count": 160, "signature": "MOBILE-API-NORMAL", "uri": "/api/v1/items/"},
         {"name": "internal_observability", "kind": "noisy_benign", "count": 120, "signature": "INTERNAL-OBS", "uri": "/secops/api/heartbeat"},
+        {"name": "admin_maintenance_powershell", "kind": "hard_negative", "count": 90, "signature": "MAINT-PS-2026", "uri": "/admin/jobs/run"},
+        {"name": "backup_window_healthcheck", "kind": "hard_negative", "count": 80, "signature": "BACKUP-HEALTH-2026", "uri": "/api/v1/health/"},
+        {"name": "allowlisted_scanner_review", "kind": "hard_negative", "count": 100, "signature": "ALLOW-SCAN-2026", "uri": "/trpg/search"},
     ]
     events: list[dict] = []
     seq = 1
@@ -42,14 +45,41 @@ def _build_events(seed: int = 20260310) -> list[dict]:
             kind = sc["kind"]
             if kind == "attack":
                 x = rng.random()
-                if x < 0.45:
-                    action = "challenge"
-                elif x < 0.80:
-                    action = "limit"
-                elif x < 0.98:
-                    action = "block"
+                if "rce" in sc["name"] or "ssrf" in sc["name"] or "path_traversal" in sc["name"]:
+                    if x < 0.72:
+                        action = "block"
+                    elif x < 0.93:
+                        action = "challenge"
+                    else:
+                        action = "limit"
+                elif "credential" in sc["name"] or "token_replay" in sc["name"]:
+                    if x < 0.78:
+                        action = "block"
+                    elif x < 0.94:
+                        action = "challenge"
+                    else:
+                        action = "limit"
+                elif "api_bola" in sc["name"] or "graphql" in sc["name"] or "scraper" in sc["name"]:
+                    if x < 0.64:
+                        action = "block"
+                    elif x < 0.92:
+                        action = "challenge"
+                    else:
+                        action = "limit"
+                elif "http_ddos" in sc["name"]:
+                    if x < 0.82:
+                        action = "block"
+                    elif x < 0.96:
+                        action = "challenge"
+                    else:
+                        action = "limit"
                 else:
-                    action = "observe"
+                    if x < 0.70:
+                        action = "block"
+                    elif x < 0.92:
+                        action = "challenge"
+                    else:
+                        action = "limit"
                 severity = "critical" if rng.random() < 0.35 else "high"
                 gt = "attack"
                 src_ip = f"198.51.100.{rng.randint(1, 254)}"
@@ -67,6 +97,32 @@ def _build_events(seed: int = 20260310) -> list[dict]:
                 gt = "noisy_benign"
                 src_ip = f"10.0.0.{rng.randint(1, 200)}"
                 ua = "secops-internal-agent/1.7"
+            elif kind == "hard_negative":
+                action = "allow" if rng.random() < 0.82 else "observe"
+                severity = "medium"
+                gt = "benign"
+                src_ip = f"203.0.113.{rng.randint(1, 254)}"
+                if "scanner" in sc["name"]:
+                    ua = rng.choice(
+                        [
+                            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                            "python-requests/2.31.0",
+                        ]
+                    )
+                elif "maintenance" in sc["name"]:
+                    ua = rng.choice(
+                        [
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36",
+                            "HeadlessChrome/124.0.0.0",
+                        ]
+                    )
+                else:
+                    ua = rng.choice(
+                        [
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 Safari/537.36",
+                            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148",
+                        ]
+                    )
             else:
                 y = rng.random()
                 if y < 0.78:
@@ -104,6 +160,7 @@ def _build_events(seed: int = 20260310) -> list[dict]:
                     "ground_truth": gt,
                     "uri": sc["uri"],
                     "ua": ua,
+                    "context_tags": ["hard_negative"] if kind == "hard_negative" else ["baseline"],
                     "processing_ms": round(rng.uniform(10, 130), 3),
                 }
             )
@@ -126,7 +183,7 @@ def _clear_workspace(workspace_slug: str) -> None:
 def main() -> None:
     workspace_slug = "latest_attack_demo"
     sensor_id = "latest-attack-sensor-01"
-    out_path = Path("docs/latest_attack_benchmark.json")
+    out_path = Path("/tmp/latest_attack_benchmark.json")
     init_db()
     _clear_workspace(workspace_slug)
     events = _build_events(seed=20260310)

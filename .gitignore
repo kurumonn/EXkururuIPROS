@@ -11,4 +11,11 @@ venv/
 logs/
 tmp/
 sensor/target/
-
+docs/e2e_quality_gate_latest.json
+docs/latest_attack_benchmark.json
+docs/perf_ipros_dedupe_query.json
+docs/perf_sensor_control_loop.json
+docs/perf_insert_security_events_db_latest.json
+docs/public_demo_metrics.json
+!docs/PUBLIC_TEST_DATASET.md
+!docs/sample_threat_intel_feed.json

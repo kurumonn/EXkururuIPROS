@@ -20,7 +20,35 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from .notifier import send_webhook
 from .parser import aggregate_lines
-from .security import expected_sensor_signature, verify_timestamp
+from .e2e_eval import (
+    bucket_5m_utc as _bucket_5m_utc_impl,
+    e2e_profile_defaults as _e2e_profile_defaults_impl,
+    e2e_regressions as _e2e_regressions_impl,
+    evaluate_action_latency_breaches as _evaluate_action_latency_breaches_impl,
+    evaluate_e2e_events as _evaluate_e2e_events_impl,
+    extract_latency_ms as _extract_latency_ms_impl,
+    is_blocked as _is_blocked_impl,
+    is_mitigated as _is_mitigated_impl,
+    percentile as _percentile_impl,
+    scenario_class as _scenario_class_impl,
+    to_float as _to_float_impl,
+)
+from .live_panel import (
+    dashboard_summary_with_stack_panel as _dashboard_summary_with_stack_panel_impl,
+    http_json_get as _http_json_get_impl,
+    probe_edr_live as _probe_edr_live_impl,
+    probe_soc_live as _probe_soc_live_impl,
+    probe_xdr_live as _probe_xdr_live_impl,
+    stack_live_panel as _stack_live_panel_impl,
+)
+from .security import (
+    expected_sensor_signature,
+    expected_sensor_signature_v2,
+    nonce_required,
+    replay_guard_add,
+    validate_nonce,
+    verify_timestamp,
+)
 from .xdr_adapter import export_events_to_xdr, export_source_heartbeat_to_xdr
 from .storage import (
     ack_action,
@@ -185,7 +213,10 @@ def _cors_headers(scope) -> list[tuple[bytes, bytes]]:
     return [
         (b"access-control-allow-origin", origin.encode("utf-8")),
         (b"access-control-allow-methods", b"GET,POST,OPTIONS"),
-        (b"access-control-allow-headers", b"Authorization,Content-Type,X-Admin-Actor,X-IPS-Sensor-Id,X-IPS-Signature,X-IPS-Timestamp"),
+        (
+            b"access-control-allow-headers",
+            b"Authorization,Content-Type,X-Admin-Actor,X-IPS-Sensor-Id,X-IPS-Signature,X-IPS-Timestamp,X-IPS-Nonce",
+        ),
         (b"access-control-max-age", b"600"),
         (b"vary", b"Origin"),
     ]
@@ -780,261 +811,27 @@ def _oidc_identity_from_bearer(token: str) -> dict | None:
 
 
 def _http_json_get(url: str, *, headers: dict[str, str] | None = None, timeout_sec: float = 1.5) -> tuple[bool, int, dict, str, float]:
-    started = time.monotonic()
-    req = urllib.request.Request(url, headers=headers or {}, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=float(timeout_sec)) as resp:
-            status_code = int(getattr(resp, "status", 200))
-            raw_body = resp.read()
-        elapsed_ms = (time.monotonic() - started) * 1000.0
-    except urllib.error.HTTPError as exc:
-        elapsed_ms = (time.monotonic() - started) * 1000.0
-        try:
-            raw = exc.read().decode("utf-8")
-            payload = json.loads(raw) if raw else {}
-        except Exception:
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
-        return False, int(exc.code), payload, f"http_error:{exc.code}", round(elapsed_ms, 3)
-    except Exception as exc:
-        elapsed_ms = (time.monotonic() - started) * 1000.0
-        return False, 0, {}, f"url_error:{exc}", round(elapsed_ms, 3)
-    try:
-        payload = json.loads(raw_body.decode("utf-8") or "{}")
-    except Exception:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    return 200 <= status_code < 300, status_code, payload, "", round(elapsed_ms, 3)
-
-
-def _to_int(value, default: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return int(default)
+    return _http_json_get_impl(url, headers=headers, timeout_sec=timeout_sec)
 
 
 def _probe_xdr_live(timeout_sec: float) -> dict[str, object]:
-    base_url = str(os.getenv("IPROS_XDR_BASE_URL", "http://127.0.0.1:8810") or "").strip().rstrip("/")
-    if not base_url:
-        return {
-            "service": "xdr",
-            "configured": False,
-            "reachable": False,
-            "status": "not_configured",
-            "latency_ms": None,
-            "dashboard_url": "",
-            "health": {},
-            "metrics": {},
-            "error": "",
-        }
-    ok, status_code, health_payload, error, latency_ms = _http_json_get(f"{base_url}/healthz", timeout_sec=timeout_sec)
-    service = {
-        "service": "xdr",
-        "configured": True,
-        "reachable": bool(ok),
-        "status": "ok" if ok else "down",
-        "latency_ms": latency_ms,
-        "dashboard_url": f"{base_url}/dashboard",
-        "health": {
-            "sources": _to_int(health_payload.get("sources"), 0),
-            "events": _to_int(health_payload.get("events"), 0),
-        },
-        "metrics": {},
-        "error": str(error or ""),
-    }
-    admin_token = str(os.getenv("IPROS_XDR_ADMIN_TOKEN", "") or "").strip()
-    if admin_token:
-        headers = {"Authorization": f"Bearer {admin_token}"}
-        incidents_ok, _, incidents_payload, incidents_error, _ = _http_json_get(
-            f"{base_url}/api/v1/incidents?limit=100",
-            headers=headers,
-            timeout_sec=timeout_sec,
-        )
-        if incidents_ok:
-            items = incidents_payload.get("items") if isinstance(incidents_payload.get("items"), list) else []
-            open_count = 0
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                status_value = str(item.get("status") or "open").strip().lower()
-                if status_value in {"open", "new"}:
-                    open_count += 1
-            service["metrics"]["incident_sample_count"] = len(items)
-            service["metrics"]["incident_open_sample"] = open_count
-        elif incidents_error:
-            service["metrics"]["incident_fetch_error"] = incidents_error
-        actions_ok, _, actions_payload, actions_error, _ = _http_json_get(
-            f"{base_url}/api/v1/actions?limit=100",
-            headers=headers,
-            timeout_sec=timeout_sec,
-        )
-        if actions_ok:
-            items = actions_payload.get("items") if isinstance(actions_payload.get("items"), list) else []
-            requested_count = 0
-            completed_count = 0
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                status_value = str(item.get("status") or "").strip().lower()
-                if status_value in {"requested", "pending", "queued"}:
-                    requested_count += 1
-                if status_value in {"completed", "done", "acked"}:
-                    completed_count += 1
-            service["metrics"]["action_sample_count"] = len(items)
-            service["metrics"]["action_requested_sample"] = requested_count
-            service["metrics"]["action_completed_sample"] = completed_count
-        elif actions_error:
-            service["metrics"]["action_fetch_error"] = actions_error
-    else:
-        service["metrics"]["admin_api"] = "token_not_set"
-    return service
+    return _probe_xdr_live_impl(timeout_sec)
 
 
 def _probe_soc_live(timeout_sec: float) -> dict[str, object]:
-    base_url = str(os.getenv("IPROS_SOC_BASE_URL", "http://127.0.0.1:8820") or "").strip().rstrip("/")
-    if not base_url:
-        return {
-            "service": "soc",
-            "configured": False,
-            "reachable": False,
-            "status": "not_configured",
-            "latency_ms": None,
-            "dashboard_url": "",
-            "health": {},
-            "metrics": {},
-            "error": "",
-        }
-    ok, _, health_payload, error, latency_ms = _http_json_get(f"{base_url}/healthz", timeout_sec=timeout_sec)
-    service = {
-        "service": "soc",
-        "configured": True,
-        "reachable": bool(ok),
-        "status": "ok" if ok else "down",
-        "latency_ms": latency_ms,
-        "dashboard_url": f"{base_url}/secops/soc/dashboard/",
-        "health": {
-            "status": str(health_payload.get("status") or ""),
-            "service_name": str(health_payload.get("service") or ""),
-            "env": str(health_payload.get("env") or ""),
-        },
-        "metrics": {},
-        "error": str(error or ""),
-    }
-    admin_token = str(os.getenv("IPROS_SOC_ADMIN_TOKEN", "") or "").strip()
-    if admin_token:
-        cmd_ok, _, cmd_payload, cmd_error, _ = _http_json_get(
-            f"{base_url}/api/v1/command-center",
-            headers={"x-admin-token": admin_token},
-            timeout_sec=timeout_sec,
-        )
-        if cmd_ok:
-            service["metrics"]["candidate_count"] = _to_int(cmd_payload.get("candidate_count"), 0)
-            service["metrics"]["source_count"] = _to_int(cmd_payload.get("source_count"), 0)
-            service["metrics"]["source_active_count"] = _to_int(cmd_payload.get("source_active_count"), 0)
-            status_counts = cmd_payload.get("candidate_status_counts")
-            if isinstance(status_counts, dict):
-                service["metrics"]["candidate_status_counts"] = {
-                    str(k): _to_int(v, 0) for k, v in status_counts.items()
-                }
-        elif cmd_error:
-            service["metrics"]["command_center_error"] = cmd_error
-    else:
-        service["metrics"]["admin_api"] = "token_not_set"
-    return service
+    return _probe_soc_live_impl(timeout_sec)
 
 
 def _probe_edr_live(timeout_sec: float) -> dict[str, object]:
-    base_url = str(os.getenv("IPROS_EDR_BASE_URL", "") or "").strip().rstrip("/")
-    if not base_url:
-        return {
-            "service": "edr",
-            "configured": False,
-            "reachable": False,
-            "status": "not_configured",
-            "latency_ms": None,
-            "dashboard_url": "",
-            "health": {},
-            "metrics": {},
-            "error": "",
-        }
-    ok, _, health_payload, error, latency_ms = _http_json_get(f"{base_url}/healthz", timeout_sec=timeout_sec)
-    service = {
-        "service": "edr",
-        "configured": True,
-        "reachable": bool(ok),
-        "status": "ok" if ok else "down",
-        "latency_ms": latency_ms,
-        "dashboard_url": f"{base_url}/dashboard",
-        "health": {
-            "events": _to_int(health_payload.get("events"), 0),
-        },
-        "metrics": {},
-        "error": str(error or ""),
-    }
-    alerts_ok, _, alerts_payload, alerts_error, _ = _http_json_get(
-        f"{base_url}/api/v1/alerts?limit=50",
-        timeout_sec=timeout_sec,
-    )
-    if alerts_ok:
-        alerts = alerts_payload.get("alerts") if isinstance(alerts_payload.get("alerts"), list) else []
-        service["metrics"]["alert_sample_count"] = len(alerts)
-    elif alerts_error:
-        service["metrics"]["alert_fetch_error"] = alerts_error
-    responses_ok, _, responses_payload, responses_error, _ = _http_json_get(
-        f"{base_url}/api/v1/responses?limit=50",
-        timeout_sec=timeout_sec,
-    )
-    if responses_ok:
-        responses = responses_payload.get("responses") if isinstance(responses_payload.get("responses"), list) else []
-        service["metrics"]["response_sample_count"] = len(responses)
-    elif responses_error:
-        service["metrics"]["response_fetch_error"] = responses_error
-    return service
+    return _probe_edr_live_impl(timeout_sec)
 
 
 def _stack_live_panel() -> dict[str, object]:
-    cache_sec = _env_int("IPS_STACK_LIVE_CACHE_SEC", 10, 1, 120)
-    now_mono = time.monotonic()
-    with _STACK_LIVE_CACHE_LOCK:
-        cached_at = float(_STACK_LIVE_CACHE.get("at") or 0.0)
-        cached = _STACK_LIVE_CACHE.get("data")
-        if isinstance(cached, dict) and (now_mono - cached_at) < float(cache_sec):
-            return dict(cached)
-
-    timeout_sec = _env_float("IPS_STACK_LIVE_HTTP_TIMEOUT_SEC", 1.5, 0.2, 10.0)
-    services = [
-        _probe_xdr_live(timeout_sec),
-        _probe_soc_live(timeout_sec),
-        _probe_edr_live(timeout_sec),
-    ]
-    configured_services = sum(1 for item in services if bool(item.get("configured")))
-    reachable_services = sum(1 for item in services if bool(item.get("reachable")))
-    panel = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "cache_sec": cache_sec,
-        "services": services,
-        "summary": {
-            "configured_services": configured_services,
-            "reachable_services": reachable_services,
-            "all_reachable": configured_services > 0 and configured_services == reachable_services,
-        },
-    }
-    with _STACK_LIVE_CACHE_LOCK:
-        _STACK_LIVE_CACHE["at"] = now_mono
-        _STACK_LIVE_CACHE["data"] = dict(panel)
-    return panel
+    return _stack_live_panel_impl()
 
 
 def _dashboard_summary_with_stack_panel() -> dict:
-    payload = dict(dashboard_summary())
-    integration = payload.get("integration") if isinstance(payload.get("integration"), dict) else {}
-    integration = dict(integration)
-    integration["live_panel"] = _stack_live_panel()
-    payload["integration"] = integration
-    return payload
+    return _dashboard_summary_with_stack_panel_impl()
 
 
 
@@ -1117,10 +914,19 @@ def _authenticate_sensor(scope, workspace_slug: str, sensor_id: str, body: bytes
     req_sensor_id = headers.get("x-ips-sensor-id", "").strip()
     signature = headers.get("x-ips-signature", "").strip()
     timestamp = headers.get("x-ips-timestamp", "").strip()
+    nonce = headers.get("x-ips-nonce", "").strip()
     if not req_sensor_id or not signature or not timestamp:
         return None, _json_response({"ok": False, "error": "missing auth headers"}, 401)
     if req_sensor_id != sensor_id:
         return None, _json_response({"ok": False, "error": "sensor mismatch"}, 403)
+    require_nonce = nonce_required()
+    try:
+        nonce = validate_nonce(nonce, required=require_nonce)
+    except ValueError as exc:
+        message = str(exc).strip().lower()
+        if "missing" in message:
+            return None, _json_response({"ok": False, "error": "missing nonce"}, 401)
+        return None, _json_response({"ok": False, "error": "invalid nonce"}, 401)
     try:
         verify_timestamp(timestamp)
     except Exception:
@@ -1128,9 +934,17 @@ def _authenticate_sensor(scope, workspace_slug: str, sensor_id: str, body: bytes
     sensor = get_sensor(workspace_slug, sensor_id)
     if not sensor:
         return None, _json_response({"ok": False, "error": "sensor not found"}, 404)
-    expected = expected_sensor_signature(sensor["shared_secret"], timestamp, body)
-    if not hmac.compare_digest(signature.encode("utf-8"), expected.encode("utf-8")):
+    expected = expected_sensor_signature_v2(sensor["shared_secret"], timestamp, body, nonce=nonce)
+    legacy = expected_sensor_signature(sensor["shared_secret"], timestamp, body)
+    if not hmac.compare_digest(signature.encode("utf-8"), expected.encode("utf-8")) and not (
+        not require_nonce and hmac.compare_digest(signature.encode("utf-8"), legacy.encode("utf-8"))
+    ):
         return None, _json_response({"ok": False, "error": "invalid signature"}, 403)
+    method = str(scope.get("method", "GET") or "GET").upper()
+    if method in {"POST", "PUT", "PATCH", "DELETE"}:
+        replay_raw = f"{workspace_slug}:{sensor_id}:{scope.get('path','')}:{timestamp}:{signature}:{nonce}"
+        if not replay_guard_add(replay_raw):
+            return None, _json_response({"ok": False, "error": "replay_detected"}, 409)
     touch_sensor(workspace_slug, sensor_id)
     return sensor, None
 
@@ -1140,6 +954,27 @@ def _parse_json_body(body: bytes):
         return json.loads(body.decode("utf-8") or "{}"), None
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None, _json_response({"ok": False, "error": "invalid json"}, 400)
+
+
+def _extract_source_event_keys(rows: list[dict] | list, limit: int = 5000) -> list[str]:
+    if not isinstance(rows, list):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    max_len = max(1, min(int(limit), 10000))
+    for row in rows:
+        source_key = ""
+        if isinstance(row, dict):
+            source_key = str(row.get("event_id") or row.get("source_event_key") or "").strip()[:140]
+        else:
+            source_key = str(row or "").strip()[:140]
+        if not source_key or source_key in seen:
+            continue
+        seen.add(source_key)
+        out.append(source_key)
+        if len(out) >= max_len:
+            break
+    return out
 
 
 def _prometheus_metrics(payload: dict) -> str:
@@ -2878,6 +2713,21 @@ async def _dispatch(scope, method: str, path: str, body: bytes):
         events = payload if isinstance(payload, list) else payload.get("events", [])
         if not isinstance(events, list):
             return _json_response({"ok": False, "error": "events must be list"}, 400)
+        headers = _headers(scope)
+        ts_raw = headers.get("x-ips-timestamp", "").strip()
+        sig_raw = headers.get("x-ips-signature", "").strip()
+        nonce_raw = headers.get("x-ips-nonce", "").strip()
+        for source_key in _extract_source_event_keys(events):
+            scoped_raw = f"{workspace_slug}:{sensor_id}:{source_key}:{ts_raw}:{sig_raw}:{nonce_raw}"
+            if not replay_guard_add(scoped_raw):
+                return _json_response(
+                    {
+                        "ok": False,
+                        "error": "replay_detected",
+                        "source_event_key": source_key,
+                    },
+                    409,
+                )
         shard_count = _ingest_shard_count()
         node_shard_index = _ingest_shard_index(shard_count)
         sensor_meta = sensor.get("meta_json") if isinstance(sensor.get("meta_json"), dict) else {}
@@ -3006,3 +2856,47 @@ async def _dispatch(scope, method: str, path: str, body: bytes):
     if path.startswith("/api/"):
         return _json_response({"ok": False, "error": "not found"}, 404)
     return _text_response(f"{method} {path} not found", 404)
+
+
+def _to_float(value, default: float = 0.0) -> float:
+    return _to_float_impl(value, default)
+
+
+def _percentile(values: list[float], p: float) -> float:
+    return _percentile_impl(values, p)
+
+
+def _is_mitigated(action: str) -> bool:
+    return _is_mitigated_impl(action)
+
+
+def _is_blocked(action: str) -> bool:
+    return _is_blocked_impl(action)
+
+
+def _bucket_5m_utc() -> str:
+    return _bucket_5m_utc_impl()
+
+
+def _extract_latency_ms(event: dict) -> float | None:
+    return _extract_latency_ms_impl(event)
+
+
+def _evaluate_action_latency_breaches(events: list[dict]) -> list[dict]:
+    return _evaluate_action_latency_breaches_impl(events)
+
+
+def _e2e_profile_defaults(profile: str) -> dict:
+    return _e2e_profile_defaults_impl(profile)
+
+
+def _scenario_class(name: str) -> str:
+    return _scenario_class_impl(name)
+
+
+def _evaluate_e2e_events(events: list[dict], thresholds: dict) -> tuple[dict, list[dict]]:
+    return _evaluate_e2e_events_impl(events, thresholds)
+
+
+def _e2e_regressions(current: dict, previous: dict | None) -> list[str]:
+    return _e2e_regressions_impl(current, previous)

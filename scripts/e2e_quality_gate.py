@@ -94,8 +94,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--out",
         type=Path,
-        default=Path("docs/e2e_quality_gate_latest.json"),
-        help="output json path (default: docs/e2e_quality_gate_latest.json)",
+        default=Path("/tmp/e2e_quality_gate.json"),
+        help="output json path (default: /tmp/e2e_quality_gate.json)",
     )
     return p.parse_args()
 

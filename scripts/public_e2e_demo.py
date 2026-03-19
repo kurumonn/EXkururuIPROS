@@ -50,36 +50,36 @@ def _pick_attack_action(scenario: str, rng: random.Random) -> str:
     # Shift to block-first on high-confidence attack families while keeping gradual mitigation.
     if s in {"identity_token_abuse_2026", "cloud_k8s_privilege_abuse_2026", "ransomware_precursor_chain_2026"}:
         x = rng.random()
-        if x < 0.60:
+        if x < 0.74:
             return "block"
-        if x < 0.88:
+        if x < 0.92:
             return "challenge"
         return "limit"
     if s in {"login_bruteforce", "credential_stuffing"}:
         x = rng.random()
-        if x < 0.50:
+        if x < 0.68:
             return "block"
-        if x < 0.80:
+        if x < 0.90:
             return "challenge"
         return "limit"
     if s in {"recon"}:
         x = rng.random()
-        if x < 0.45:
+        if x < 0.62:
             return "block"
-        if x < 0.80:
+        if x < 0.90:
             return "challenge"
         return "limit"
     if s in {"api_abuse", "scraping"}:
         x = rng.random()
-        if x < 0.35:
+        if x < 0.55:
             return "block"
-        if x < 0.75:
+        if x < 0.88:
             return "challenge"
         return "limit"
     x = rng.random()
-    if x < 0.35:
+    if x < 0.58:
         return "block"
-    if x < 0.75:
+    if x < 0.90:
         return "challenge"
     return "limit"
 
@@ -106,6 +106,9 @@ def _scenario_rows() -> list[dict]:
         {"scenario": "crawler_search_bot", "count": 120, "kind": "benign", "signature": "CRAWLER-TRAFFIC", "uri": "/trpg/"},
         {"scenario": "internal_noisy_traffic", "count": 80, "kind": "noisy_benign", "signature": "INTERNAL-NOISE", "uri": "/secops/api/heartbeat"},
         {"scenario": "mobile_network_fluctuation", "count": 100, "kind": "benign", "signature": "MOBILE-FLUCT", "uri": "/account/profile/"},
+        {"scenario": "admin_maintenance_powershell", "count": 70, "kind": "hard_negative", "signature": "MAINT-PS-2026", "uri": "/admin/jobs/run"},
+        {"scenario": "backup_window_healthcheck", "count": 60, "kind": "hard_negative", "signature": "BACKUP-HEALTH-2026", "uri": "/api/v1/health/"},
+        {"scenario": "allowlisted_scanner_review", "count": 90, "kind": "hard_negative", "signature": "ALLOW-SCAN-2026", "uri": "/trpg/search"},
     ]
 
 
@@ -136,6 +139,16 @@ def build_demo_events(seed: int = 42) -> list[dict]:
                 severity = "medium"
                 gt = "noisy_benign"
                 ua = rng.choice(uas["internal"])
+            elif kind == "hard_negative":
+                action = "allow" if rng.random() < 0.8 else "observe"
+                severity = "medium"
+                gt = "benign"
+                if "scanner" in scenario:
+                    ua = rng.choice(uas["crawler"] + uas["tooling"])
+                elif "maintenance" in scenario:
+                    ua = rng.choice(uas["tooling"] + uas["browser"])
+                else:
+                    ua = rng.choice(uas["browser"] + uas["tooling"])
             else:
                 action = _pick_benign_action(rng)
                 severity = "low"
@@ -172,6 +185,7 @@ def build_demo_events(seed: int = 42) -> list[dict]:
                     "ground_truth": gt,
                     "uri": uri,
                     "ua": ua,
+                    "context_tags": ["hard_negative"] if kind == "hard_negative" else ["baseline"],
                     "processing_ms": round(processing_ms, 3),
                 }
             )
@@ -259,7 +273,7 @@ def main() -> None:
     args = _parse_args()
     workspace_slug = "public_demo"
     sensor_id = "public-demo-sensor-01"
-    out_path = Path("docs/public_demo_metrics.json")
+    out_path = Path("/tmp/public_demo_metrics.json")
     events = build_demo_events(seed=int(args.seed))
     ingest_result: dict[str, object]
     if args.mode == "db":

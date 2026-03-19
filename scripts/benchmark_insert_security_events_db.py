@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--out",
         type=Path,
-        default=Path("/home/kurumonn/exkururuIPROS/docs/perf_insert_security_events_db_latest.json"),
+        default=Path("/tmp/perf_insert_security_events_db.json"),
         help="output json path",
     )
     return p.parse_args()

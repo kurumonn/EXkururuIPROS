@@ -84,7 +84,7 @@ def main() -> int:
     parser.add_argument("--actions", type=int, default=120, help="number of actions in one control loop")
     parser.add_argument("--ack-delay-ms", type=float, default=20.0, help="mock server delay per ack request")
     parser.add_argument("--ack-parallelism", type=int, default=8, help="parallel workers for ack path")
-    parser.add_argument("--out", type=Path, default=Path("docs/perf_sensor_control_loop.json"))
+    parser.add_argument("--out", type=Path, default=Path("/tmp/perf_sensor_control_loop.json"))
     args = parser.parse_args()
 
     port = _find_free_port()
@@ -132,4 +132,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

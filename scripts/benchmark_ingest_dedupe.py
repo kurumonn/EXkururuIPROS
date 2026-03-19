@@ -126,7 +126,7 @@ def main() -> None:
     parser.add_argument("--existing", type=int, default=120000, help="pre-seeded rows in security_events")
     parser.add_argument("--batch", type=int, default=30000, help="incoming event count")
     parser.add_argument("--duplicate-ratio", type=float, default=0.4, help="ratio of incoming duplicate source keys")
-    parser.add_argument("--out", type=Path, default=Path("docs/perf_ipros_dedupe_query.json"))
+    parser.add_argument("--out", type=Path, default=Path("/tmp/perf_ipros_dedupe_query.json"))
     args = parser.parse_args()
 
     workspace = "benchmark-workspace"
