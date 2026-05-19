@@ -50,7 +50,34 @@ from .security import (
     verify_timestamp,
 )
 from .xdr_adapter import export_events_to_xdr, export_source_heartbeat_to_xdr
+from .vuln import (
+    classify_cve_for_server,
+    get_vuln_summary,
+    list_vulnerability_records,
+    sync_cisa_kev,
+    upsert_vulnerability_finding,
+    upsert_vulnerability_record,
+)
+from .cloudflare_ip import (
+    is_cloudflare_ip,
+    normalize_client_ip,
+    sync_cloudflare_ip_ranges,
+)
+from .deploy_tracker import (
+    classify_response_time as classify_response_time_deploy,
+    get_current_deploy,
+    incident_fingerprint as make_incident_fingerprint,
+    is_warmup_now,
+    list_policy_audit_logs,
+    mark_deploy_failed,
+    mark_deploy_started,
+    mark_deploy_succeeded,
+    record_policy_audit_log,
+    AUDITABLE_ACTIONS,
+)
 from .storage import (
+    incident_fingerprint,
+    link_event_to_incident,
     ack_action,
     cancel_block_actions_for_target,
     create_block_action,
@@ -2852,6 +2879,283 @@ async def _dispatch(scope, method: str, path: str, body: bytes):
                 **result,
             }
         )
+
+    # ── Vulnerability / CVSS / EPSS ───────────────────────────────────────────
+    if method == "GET" and path == "/api/v1/admin/vuln/summary/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        query = _query_params(scope)
+        ws = str((query.get("workspace_slug") or [os.getenv("IPROS_DEFAULT_WORKSPACE", "lab")])[0]).strip()
+        return _json_response({"ok": True, "summary": get_vuln_summary(ws)})
+
+    if method == "GET" and path == "/api/v1/admin/vuln/records/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        query = _query_params(scope)
+        ws = str((query.get("workspace_slug") or [os.getenv("IPROS_DEFAULT_WORKSPACE", "lab")])[0]).strip()
+        severity = str((query.get("severity") or [""])[0]).strip().lower()
+        kev_only = str((query.get("kev_only") or [""])[0]).strip().lower() in {"1", "true"}
+        limit = min(int((query.get("limit") or ["100"])[0] or 100), 500)
+        offset = max(int((query.get("offset") or ["0"])[0] or 0), 0)
+        records = list_vulnerability_records(ws, severity=severity, kev_only=kev_only, limit=limit, offset=offset)
+        return _json_response({"ok": True, "records": records, "count": len(records)})
+
+    if method == "POST" and path == "/api/v1/admin/vuln/records/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        payload, err = _parse_json_body(body)
+        if err:
+            return err
+        ws = str(payload.get("workspace_slug") or os.getenv("IPROS_DEFAULT_WORKSPACE", "lab")).strip()
+        cve_id = str(payload.get("cve_id") or "").strip().upper()
+        if not cve_id:
+            return _json_response({"ok": False, "error": "cve_id required"}, 400)
+        cvss_raw = payload.get("cvss_score")
+        cvss_score = float(cvss_raw) if cvss_raw is not None else None
+        rid = upsert_vulnerability_record(
+            ws, cve_id,
+            cvss_score=cvss_score,
+            cvss_vector=str(payload.get("cvss_vector") or ""),
+            title=str(payload.get("title") or ""),
+            summary=str(payload.get("summary") or ""),
+            server_status=str(payload.get("server_status") or "unknown"),
+            source=str(payload.get("source") or "manual"),
+            raw_json=payload.get("raw_json") if isinstance(payload.get("raw_json"), dict) else None,
+        )
+        return _json_response({"ok": True, "id": rid}, 201)
+
+    if method == "POST" and path == "/api/v1/admin/vuln/sync/cisa-kev/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        payload, err = _parse_json_body(body)
+        if err:
+            payload = {}
+        ws = str((payload or {}).get("workspace_slug") or os.getenv("IPROS_DEFAULT_WORKSPACE", "lab")).strip()
+        result = sync_cisa_kev(ws)
+        status_code = 200 if result.get("status") == "ok" else 500
+        return _json_response({"ok": result.get("status") == "ok", **result}, status_code)
+
+    if method == "POST" and path == "/api/v1/admin/vuln/findings/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        payload, err = _parse_json_body(body)
+        if err:
+            return err
+        ws = str(payload.get("workspace_slug") or os.getenv("IPROS_DEFAULT_WORKSPACE", "lab")).strip()
+        cve_id = str(payload.get("cve_id") or "").strip().upper()
+        asset_host = str(payload.get("asset_host") or "").strip()
+        if not cve_id or not asset_host:
+            return _json_response({"ok": False, "error": "cve_id and asset_host required"}, 400)
+        upsert_vulnerability_finding(
+            ws, cve_id, asset_host,
+            status=str(payload.get("status") or "unknown"),
+            note=str(payload.get("note") or ""),
+            asset_version=str(payload.get("asset_version") or ""),
+        )
+        return _json_response({"ok": True})
+
+    if method == "POST" and path == "/api/v1/admin/vuln/classify-cve/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        payload, err = _parse_json_body(body)
+        if err:
+            return err
+        cve_id = str(payload.get("cve_id") or "").strip().upper()
+        component_versions = payload.get("component_versions") or {}
+        if not isinstance(component_versions, dict):
+            component_versions = {}
+        result = classify_cve_for_server(cve_id, component_versions)
+        return _json_response({"ok": True, "cve_id": cve_id, **result})
+
+    # ── Cloudflare IP normalization ────────────────────────────────────────────
+    if method == "POST" and path == "/api/v1/admin/cloudflare/sync/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        result = sync_cloudflare_ip_ranges()
+        status_code = 200 if result.get("status") == "ok" else 500
+        return _json_response({"ok": result.get("status") == "ok", **result}, status_code)
+
+    if method == "GET" and path == "/api/v1/admin/cloudflare/check/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        query = _query_params(scope)
+        ip_str = str((query.get("ip") or [""])[0]).strip()
+        if not ip_str:
+            return _json_response({"ok": False, "error": "ip parameter required"}, 400)
+        return _json_response({"ok": True, "ip": ip_str, "is_cloudflare": is_cloudflare_ip(ip_str)})
+
+    # ── Deploy event tracking ──────────────────────────────────────────────────
+    if method == "POST" and path == "/api/v1/admin/deploy/start/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        payload, err = _parse_json_body(body)
+        if err:
+            return err
+        ws = str(payload.get("workspace_slug") or os.getenv("IPROS_DEFAULT_WORKSPACE", "lab")).strip()
+        deploy_id = str(payload.get("deploy_id") or "").strip()
+        if not deploy_id:
+            return _json_response({"ok": False, "error": "deploy_id required"}, 400)
+        row_id = mark_deploy_started(
+            deploy_id,
+            commit_hash=str(payload.get("commit_hash") or ""),
+            actor=str(payload.get("actor") or "system"),
+            workspace_slug=ws,
+            image_tag=str(payload.get("image_tag") or ""),
+            notes=str(payload.get("notes") or ""),
+            warmup_minutes=int(payload.get("warmup_minutes") or 15),
+        )
+        record_policy_audit_log(
+            "deploy_start", str(payload.get("actor") or "system"),
+            workspace_slug=ws, policy_id=deploy_id,
+            detail={"commit_hash": str(payload.get("commit_hash") or "")},
+        )
+        return _json_response({"ok": True, "id": row_id, "deploy_id": deploy_id}, 201)
+
+    if method == "POST" and path == "/api/v1/admin/deploy/success/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        payload, err = _parse_json_body(body)
+        if err:
+            return err
+        ws = str(payload.get("workspace_slug") or os.getenv("IPROS_DEFAULT_WORKSPACE", "lab")).strip()
+        deploy_id = str(payload.get("deploy_id") or "").strip()
+        if not deploy_id:
+            return _json_response({"ok": False, "error": "deploy_id required"}, 400)
+        wm_raw = payload.get("warmup_minutes")
+        warmup_minutes = int(wm_raw) if wm_raw is not None else None
+        mark_deploy_succeeded(deploy_id, workspace_slug=ws, warmup_minutes=warmup_minutes)
+        in_warmup, deploy = is_warmup_now(ws)
+        record_policy_audit_log(
+            "deploy_success", str(payload.get("actor") or "system"),
+            workspace_slug=ws, policy_id=deploy_id,
+            detail={"warmup_until": deploy.get("warmup_until") if deploy else None},
+        )
+        return _json_response({"ok": True, "in_warmup": in_warmup, "deploy": deploy})
+
+    if method == "POST" and path == "/api/v1/admin/deploy/failed/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        payload, err = _parse_json_body(body)
+        if err:
+            return err
+        ws = str(payload.get("workspace_slug") or os.getenv("IPROS_DEFAULT_WORKSPACE", "lab")).strip()
+        deploy_id = str(payload.get("deploy_id") or "").strip()
+        if not deploy_id:
+            return _json_response({"ok": False, "error": "deploy_id required"}, 400)
+        mark_deploy_failed(deploy_id, reason=str(payload.get("reason") or ""), workspace_slug=ws)
+        record_policy_audit_log(
+            "deploy_failed", str(payload.get("actor") or "system"),
+            workspace_slug=ws, policy_id=deploy_id,
+            detail={"reason": str(payload.get("reason") or "")},
+            outcome="error",
+        )
+        return _json_response({"ok": True})
+
+    if method == "GET" and path == "/api/v1/admin/deploy/current/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        query = _query_params(scope)
+        ws = str((query.get("workspace_slug") or [os.getenv("IPROS_DEFAULT_WORKSPACE", "lab")])[0]).strip()
+        in_warmup, deploy = is_warmup_now(ws)
+        current = get_current_deploy(ws)
+        return _json_response({
+            "ok": True,
+            "current": current,
+            "in_warmup": in_warmup,
+            "warmup_until": deploy.get("warmup_until") if deploy else None,
+        })
+
+    if method == "GET" and path == "/api/v1/admin/deploy/warmup-status/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        query = _query_params(scope)
+        ws = str((query.get("workspace_slug") or [os.getenv("IPROS_DEFAULT_WORKSPACE", "lab")])[0]).strip()
+        avg_ms = float((query.get("avg_ms") or ["0"])[0] or 0)
+        p95_ms = float((query.get("p95_ms") or ["0"])[0] or 0)
+        classification = classify_response_time_deploy(avg_ms, p95_ms, workspace_slug=ws)
+        return _json_response({"ok": True, **classification})
+
+    # ── Policy audit log ───────────────────────────────────────────────────────
+    if method == "GET" and path == "/api/v1/admin/policy-audit/logs/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        query = _query_params(scope)
+        ws = str((query.get("workspace_slug") or [os.getenv("IPROS_DEFAULT_WORKSPACE", "lab")])[0]).strip()
+        action_filter = str((query.get("action") or [""])[0]).strip()
+        limit = min(int((query.get("limit") or ["100"])[0] or 100), 500)
+        offset = max(int((query.get("offset") or ["0"])[0] or 0), 0)
+        logs = list_policy_audit_logs(ws, action=action_filter, limit=limit, offset=offset)
+        return _json_response({"ok": True, "logs": logs, "count": len(logs)})
+
+    if method == "POST" and path == "/api/v1/admin/policy-audit/logs/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        payload, err = _parse_json_body(body)
+        if err:
+            return err
+        ws = str(payload.get("workspace_slug") or os.getenv("IPROS_DEFAULT_WORKSPACE", "lab")).strip()
+        action = str(payload.get("action") or "").strip()
+        if not action:
+            return _json_response({"ok": False, "error": "action required"}, 400)
+        log_id = record_policy_audit_log(
+            action, str(payload.get("actor") or "system"),
+            workspace_slug=ws,
+            policy_id=str(payload.get("policy_id") or ""),
+            target_type=str(payload.get("target_type") or ""),
+            target_value=str(payload.get("target_value") or ""),
+            detail=payload.get("detail") if isinstance(payload.get("detail"), dict) else None,
+            outcome=str(payload.get("outcome") or "ok"),
+            ip_address=str(payload.get("ip_address") or ""),
+        )
+        return _json_response({"ok": True, "id": log_id}, 201)
+
+    # ── Incident fingerprint / event link ──────────────────────────────────────
+    if method == "POST" and path == "/api/v1/admin/soc/incidents/link-event/":
+        ok, auth_response = _require_admin_auth(scope)
+        if not ok:
+            return auth_response
+        payload, err = _parse_json_body(body)
+        if err:
+            return err
+        ws = str(payload.get("workspace_slug") or os.getenv("IPROS_DEFAULT_WORKSPACE", "lab")).strip()
+        sensor_id = str(payload.get("sensor_id") or "").strip()
+        remote_addr = str(payload.get("remote_addr") or "").strip()
+        hdrs = payload.get("headers") or {}
+        if not isinstance(hdrs, dict):
+            hdrs = {}
+        normalized_ip, was_cf = normalize_client_ip(remote_addr, hdrs)
+        signature = str(payload.get("signature") or "").strip().lower()
+        severity = str(payload.get("severity") or "high").strip().lower()
+        target = str(payload.get("target") or "generic").strip()
+        title = str(payload.get("title") or f"{signature} from {normalized_ip}").strip()
+        result = link_event_to_incident(
+            ws, sensor_id, normalized_ip, signature, severity, title,
+            target=target,
+            first_seen_at=str(payload.get("first_seen_at") or ""),
+            last_seen_at=str(payload.get("last_seen_at") or ""),
+        )
+        return _json_response({
+            "ok": True,
+            "normalized_ip": normalized_ip,
+            "was_cloudflare": was_cf,
+            "fingerprint": make_incident_fingerprint(normalized_ip, signature, target, severity),
+            **result,
+        }, 201 if result.get("created") else 200)
 
     if path.startswith("/api/"):
         return _json_response({"ok": False, "error": "not found"}, 404)

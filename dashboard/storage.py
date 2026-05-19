@@ -665,6 +665,107 @@ CREATE TABLE IF NOT EXISTS threat_intel_sync_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_threat_intel_sync_runs_recent ON threat_intel_sync_runs (created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_threat_intel_sync_runs_source_recent ON threat_intel_sync_runs (feed_source, created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS vulnerability_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_slug TEXT NOT NULL DEFAULT 'default',
+  cve_id TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  cvss_score REAL,
+  cvss_vector TEXT NOT NULL DEFAULT '',
+  cvss_severity TEXT NOT NULL DEFAULT 'unknown',
+  epss_score REAL,
+  epss_percentile REAL,
+  kev_flag INTEGER NOT NULL DEFAULT 0,
+  kev_date_added TEXT,
+  due_date TEXT,
+  affected_products TEXT NOT NULL DEFAULT '[]',
+  server_status TEXT NOT NULL DEFAULT 'unknown',
+  known_ransomware TEXT NOT NULL DEFAULT '',
+  published_at TEXT,
+  source TEXT NOT NULL DEFAULT 'manual',
+  last_seen_at TEXT NOT NULL,
+  raw_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vuln_records_ws_cve ON vulnerability_records (workspace_slug, cve_id);
+CREATE INDEX IF NOT EXISTS idx_vuln_records_severity ON vulnerability_records (workspace_slug, cvss_severity, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vuln_records_kev ON vulnerability_records (workspace_slug, kev_flag, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vuln_records_epss ON vulnerability_records (workspace_slug, epss_percentile DESC);
+
+CREATE TABLE IF NOT EXISTS vulnerability_findings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_slug TEXT NOT NULL DEFAULT 'default',
+  cve_id TEXT NOT NULL,
+  asset_host TEXT NOT NULL DEFAULT '',
+  asset_version TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'unknown',
+  note TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vuln_findings_ws_cve_host ON vulnerability_findings (workspace_slug, cve_id, asset_host);
+CREATE INDEX IF NOT EXISTS idx_vuln_findings_lookup ON vulnerability_findings (workspace_slug, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS vuln_scan_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_slug TEXT NOT NULL DEFAULT 'default',
+  source TEXT NOT NULL DEFAULT 'cisa_kev',
+  status TEXT NOT NULL DEFAULT 'pending',
+  trigger TEXT NOT NULL DEFAULT 'scheduled',
+  found_count INTEGER NOT NULL DEFAULT 0,
+  accepted_count INTEGER NOT NULL DEFAULT 0,
+  error_message TEXT NOT NULL DEFAULT '',
+  checksum_sha256 TEXT NOT NULL DEFAULT '',
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vuln_scan_jobs_recent ON vuln_scan_jobs (workspace_slug, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS cloudflare_ip_ranges (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  cidr TEXT NOT NULL,
+  ip_version INTEGER NOT NULL DEFAULT 4,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_cloudflare_ip_ranges_cidr ON cloudflare_ip_ranges (cidr);
+CREATE INDEX IF NOT EXISTS idx_cloudflare_ip_ranges_updated ON cloudflare_ip_ranges (updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS deploy_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_slug TEXT NOT NULL DEFAULT 'default',
+  deploy_id TEXT NOT NULL,
+  commit_hash TEXT NOT NULL DEFAULT '',
+  image_tag TEXT NOT NULL DEFAULT '',
+  actor TEXT NOT NULL DEFAULT 'system',
+  status TEXT NOT NULL DEFAULT 'started',
+  warmup_minutes INTEGER NOT NULL DEFAULT 15,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  warmup_until TEXT,
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_deploy_events_id ON deploy_events (workspace_slug, deploy_id);
+CREATE INDEX IF NOT EXISTS idx_deploy_events_recent ON deploy_events (workspace_slug, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_deploy_events_status ON deploy_events (workspace_slug, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS policy_audit_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_slug TEXT NOT NULL DEFAULT 'default',
+  action TEXT NOT NULL,
+  actor TEXT NOT NULL DEFAULT 'system',
+  policy_id TEXT NOT NULL DEFAULT '',
+  target_type TEXT NOT NULL DEFAULT '',
+  target_value TEXT NOT NULL DEFAULT '',
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  outcome TEXT NOT NULL DEFAULT 'ok',
+  ip_address TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_policy_audit_action ON policy_audit_logs (workspace_slug, action, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_policy_audit_actor ON policy_audit_logs (workspace_slug, actor, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_policy_audit_recent ON policy_audit_logs (workspace_slug, created_at DESC);
 """
 
 
@@ -5251,3 +5352,125 @@ def dashboard_summary() -> dict:
     _DASHBOARD_SUMMARY_CACHE["at"] = now_mono
     _DASHBOARD_SUMMARY_CACHE["data"] = dict(payload)
     return payload
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Incident fingerprinting and campaign auto-link
+# ──────────────────────────────────────────────────────────────────────────────
+
+def incident_fingerprint(
+    normalized_ip: str,
+    signature: str,
+    target: str = "generic",
+    severity: str = "high",
+) -> str:
+    """Stable correlation key: attacker IP + technique + target + severity."""
+    parts = [
+        str(normalized_ip or "").strip(),
+        str(signature or "").strip().lower(),
+        str(target or "generic").strip().lower(),
+        str(severity or "high").strip().lower(),
+    ]
+    return "|".join(parts)
+
+
+def link_event_to_incident(
+    workspace_slug: str,
+    sensor_id: str,
+    normalized_ip: str,
+    signature: str,
+    severity: str,
+    title: str,
+    *,
+    target: str = "generic",
+    first_seen_at: str | None = None,
+    last_seen_at: str | None = None,
+) -> dict:
+    """Upsert a SOC incident using fingerprint-based correlation key."""
+    fprint = incident_fingerprint(normalized_ip, signature, target, severity)
+    now = utcnow()
+    fs = first_seen_at or now
+    ls = last_seen_at or now
+
+    with connect() as conn:
+        existing = conn.execute(
+            "SELECT id, event_count FROM soc_incidents WHERE workspace_slug=? AND correlation_key=?",
+            (workspace_slug, fprint),
+        ).fetchone()
+
+        if existing:
+            conn.execute(
+                """UPDATE soc_incidents
+                   SET event_count=event_count+1, last_seen_at=?, updated_at=?
+                   WHERE workspace_slug=? AND correlation_key=?""",
+                (ls, now, workspace_slug, fprint),
+            )
+            return {"incident_id": existing["id"], "created": False}
+
+        cur = conn.execute(
+            """INSERT INTO soc_incidents
+               (workspace_slug, sensor_id, correlation_key, title, severity, status,
+                event_count, first_seen_at, last_seen_at, created_at, updated_at, meta_json)
+               VALUES (?,?,?,?,?,?,1,?,?,?,?,?)""",
+            (workspace_slug, sensor_id, fprint, title, severity, "open",
+             fs, ls, now, now, "{}"),
+        )
+        return {"incident_id": cur.lastrowid, "created": True}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Policy audit log
+# ──────────────────────────────────────────────────────────────────────────────
+
+def record_policy_audit_log(
+    action: str,
+    actor: str = "system",
+    *,
+    workspace_slug: str = "default",
+    policy_id: str = "",
+    target_type: str = "",
+    target_value: str = "",
+    detail: dict | None = None,
+    outcome: str = "ok",
+    ip_address: str = "",
+) -> int:
+    now = utcnow()
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO policy_audit_logs
+               (workspace_slug, action, actor, policy_id, target_type, target_value,
+                detail_json, outcome, ip_address, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                workspace_slug, action, actor, policy_id,
+                target_type, target_value,
+                json.dumps(detail or {}), outcome, ip_address, now,
+            ),
+        )
+        return cur.lastrowid or 0
+
+
+def list_policy_audit_logs(
+    workspace_slug: str = "default",
+    *,
+    action: str = "",
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict]:
+    wheres = ["workspace_slug=?"]
+    params: list = [workspace_slug]
+    if action:
+        wheres.append("action=?")
+        params.append(action)
+    sql = f"""
+        SELECT id, action, actor, policy_id, target_type, target_value,
+               detail_json, outcome, ip_address, created_at
+        FROM policy_audit_logs
+        WHERE {' AND '.join(wheres)}
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+    """
+    params += [limit, offset]
+    with connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
