@@ -3614,23 +3614,34 @@ def create_block_action(payload: dict) -> dict:
 
 def fetch_pending_actions(workspace_slug: str, sensor_id: str, limit: int) -> list[dict]:
     setting = get_workspace_setting(workspace_slug)
-    if not bool(setting.get("waf_enabled")):
-        return []
+    waf_enabled = bool(setting.get("waf_enabled"))
     now = datetime.now(timezone.utc).isoformat()
     with connect() as conn:
         conn.execute(
             "UPDATE block_actions SET status = 'expired' WHERE workspace_slug = ? AND status = 'pending' AND expires_at < ?",
             (workspace_slug, now),
         )
-        rows = conn.execute(
-            """
-            SELECT * FROM block_actions
-            WHERE workspace_slug = ? AND status = 'pending'
-            ORDER BY created_at ASC, id ASC
-            LIMIT ?
-            """,
-            (workspace_slug, limit),
-        ).fetchall()
+        if waf_enabled:
+            rows = conn.execute(
+                """
+                SELECT * FROM block_actions
+                WHERE workspace_slug = ? AND status = 'pending'
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (workspace_slug, limit),
+            ).fetchall()
+        else:
+            # WAF disabled: only deliver kernel_module_blacklist (auto-remediation bypasses WAF gate)
+            rows = conn.execute(
+                """
+                SELECT * FROM block_actions
+                WHERE workspace_slug = ? AND status = 'pending' AND target_type = 'kernel_module_blacklist'
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (workspace_slug, limit),
+            ).fetchall()
         ids = [row["id"] for row in rows]
         if ids:
             conn.executemany(
@@ -4577,6 +4588,78 @@ def _match_workspace_asset(
     return best
 
 
+_PINTHEFT_SIGNATURE_HINTS: frozenset[str] = frozenset({
+    "pintheft", "pin_theft", "rds_zcopy", "rds zerocopy",
+    "rds_message_zcopy", "iouring_lpe", "rds_tcp lpe",
+    "kernel_lpe_pintheft",
+})
+_PINTHEFT_EVENT_TYPES: frozenset[str] = frozenset({
+    "pintheft_lpe", "rds_lpe", "iouring_lpe", "kernel_rds_lpe",
+    "kernel_lpe_pintheft",
+})
+_PINTHEFT_LABELS: frozenset[str] = frozenset({
+    "pintheft", "pintheft-lpe", "rds-lpe", "iouring-lpe", "rds-zcopy",
+})
+
+
+def _is_pintheft_event(event: dict) -> bool:
+    sig = str(event.get("signature") or event.get("rule") or "").strip().lower()
+    if any(h in sig for h in _PINTHEFT_SIGNATURE_HINTS):
+        return True
+    labels = event.get("labels") or event.get("tags") or []
+    if isinstance(labels, list):
+        label_set = {str(x).strip().lower() for x in labels}
+        if label_set & _PINTHEFT_LABELS:
+            return True
+    event_type = str(event.get("event_type") or "").strip().lower()
+    if event_type in _PINTHEFT_EVENT_TYPES:
+        return True
+    return False
+
+
+def _auto_enqueue_pintheft_mitigation(workspace_slug: str, conn: sqlite3.Connection) -> bool:
+    """Queue a kernel_module_blacklist action for PinTheft (RDS LPE) if not already queued.
+
+    Always creates a 'pending' action regardless of waf_enabled so that the sensor can
+    apply the modprobe blacklist even when the WAF is in observe/disabled mode.
+    Returns True if a new action was enqueued.
+    """
+    now = datetime.now(timezone.utc)
+    dedup_window_start = (now - timedelta(hours=24)).isoformat()
+    row = conn.execute(
+        """
+        SELECT id FROM block_actions
+        WHERE workspace_slug = ? AND target_type = 'kernel_module_blacklist'
+          AND target_value = 'rds_tcp,rds'
+          AND status IN ('pending', 'sent', 'applied')
+          AND created_at >= ?
+        LIMIT 1
+        """,
+        (workspace_slug, dedup_window_start),
+    ).fetchone()
+    if row:
+        return False
+    ttl_sec = 86400
+    expires_at = (now + timedelta(seconds=ttl_sec)).isoformat()
+    conn.execute(
+        """
+        INSERT INTO block_actions (
+          workspace_slug, sensor_id, target_type, target_value, stage, ttl_seconds, reason, status,
+          created_at, expires_at, acknowledged_at, response_meta
+        )
+        VALUES (?, NULL, 'kernel_module_blacklist', 'rds_tcp,rds', 'block', ?, ?, 'pending', ?, ?, NULL, '{}')
+        """,
+        (
+            workspace_slug,
+            ttl_sec,
+            "PinTheft LPE auto-mitigation: RDS zerocopy refcount bug via io_uring (CVE-PENDING-PINTHEFT)",
+            now.isoformat(),
+            expires_at,
+        ),
+    )
+    return True
+
+
 def insert_security_events(workspace_slug: str, sensor_id: str, events: list[dict]) -> dict:
     accepted = 0
     skipped = 0
@@ -4878,6 +4961,11 @@ def insert_security_events(workspace_slug: str, sensor_id: str, events: list[dic
     latency_rows = upsert_action_latency_metrics(workspace_slug, accepted_events)
     flow_rows = upsert_flow_findings(workspace_slug, accepted_events)
     incident_result = upsert_soc_incidents_from_events(workspace_slug, sensor_id, accepted_events)
+    pintheft_queued = 0
+    if accepted_events and any(_is_pintheft_event(e) for e in accepted_events):
+        with connect() as conn:
+            if _auto_enqueue_pintheft_mitigation(workspace_slug, conn):
+                pintheft_queued = 1
     return {
         "accepted": accepted,
         "skipped": skipped,
@@ -4889,6 +4977,7 @@ def insert_security_events(workspace_slug: str, sensor_id: str, events: list[dic
         "flow_rows": flow_rows,
         "latency_rows": latency_rows,
         "incident_result": incident_result,
+        "pintheft_queued": pintheft_queued,
     }
 
 

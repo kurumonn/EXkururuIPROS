@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from scripts.public_e2e_demo import evaluate
+from scripts.public_e2e_demo import build_demo_events, evaluate
 
 
 def test_evaluate_separates_attack_and_benign() -> None:
