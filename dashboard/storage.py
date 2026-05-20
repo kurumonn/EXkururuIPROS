@@ -1198,6 +1198,9 @@ def _signature_family(signature: str) -> str:
         return "waf"
     if s.startswith("bot-") or "bot" in s:
         return "bot"
+    # Kernel LPE / PinTheft (2026-05-20): RDS zerocopy refcount bug via io_uring
+    if any(t in s for t in ("kernel_lpe", "pintheft", "_lpe", "privilege_escalation")):
+        return "kernel_lpe"
     token = s.replace(":", "-").split("-", 1)[0]
     return token[:32] if token else "generic"
 
@@ -1220,6 +1223,12 @@ def _is_high_risk_signature(signature: str) -> bool:
         "cve",
         "scrape",
         "ddos",
+        # Kernel LPE / PinTheft (2026-05-20)
+        "lpe",
+        "pintheft",
+        "privilege_escalation",
+        "kernel_exploit",
+        "iouring_abuse",
     )
     return any(k in s for k in keywords)
 

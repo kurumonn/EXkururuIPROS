@@ -34,6 +34,20 @@ _NGINX_PATCHED: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
     "CVE-2026-42945": ((1, 31, 0), (1, 30, 1)),
 }
 
+# Linux Kernel LPE CVEs mitigated by module blacklisting.
+# component_versions key: "rds_module" → "unloaded" | "blacklisted" means mitigated.
+# Ref: https://security.sios.jp/vulnerability/kernel-security-vulnerability-20260520/
+_LINUX_KERNEL_LPE_MITIGATED: dict[str, dict] = {
+    "CVE-PENDING-PINTHEFT": {
+        "title": "PinTheft: Linux Kernel LPE via RDS zerocopy + io_uring",
+        "mitigation_keys": ("rds_module", "rds_mitigation"),
+        "mitigated_values": {"unloaded", "blacklisted", "disabled", "false", "0"},
+        "affected_component": "linux_kernel_rds",
+        "cvss_score": 7.8,
+        "cvss_vector": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+    },
+}
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Schema (appended to storage.SCHEMA_SQL via storage.py additions)
@@ -136,7 +150,7 @@ def classify_cve_for_server(
 ) -> dict[str, Any]:
     """
     Returns server_vulnerable, severity label, and display context.
-    component_versions: {"nginx": "1.31.0", "postgresql": "16.3", ...}
+    component_versions: {"nginx": "1.31.0", "rds_module": "unloaded", ...}
     """
     cve_upper = str(cve_id or "").upper().strip()
 
@@ -159,6 +173,42 @@ def classify_cve_for_server(
             "label": "vulnerable_probe",
             "message": f"Server may be vulnerable (nginx {nginx_ver_str}). Patch immediately.",
             "action": "patch_urgent",
+        }
+
+    # Linux Kernel LPE: check modprobe-based mitigation status
+    if cve_upper in _LINUX_KERNEL_LPE_MITIGATED:
+        lpe_info = _LINUX_KERNEL_LPE_MITIGATED[cve_upper]
+        mitigated = False
+        for key in lpe_info.get("mitigation_keys", ()):
+            val = str(component_versions.get(key, "") or "").strip().lower()
+            if val in lpe_info.get("mitigated_values", set()):
+                mitigated = True
+                break
+        if mitigated:
+            return {
+                "server_vulnerable": False,
+                "severity": "info",
+                "label": "mitigated_lpe",
+                "message": (
+                    f"{lpe_info['title']}: RDS module is unloaded/blacklisted. "
+                    "Apply kernel patch when available."
+                ),
+                "action": "monitor",
+                "cvss_score": lpe_info.get("cvss_score"),
+                "cvss_vector": lpe_info.get("cvss_vector", ""),
+            }
+        rds_status = str(component_versions.get("rds_module", "") or "unknown").strip()
+        return {
+            "server_vulnerable": True,
+            "severity": "high",
+            "label": "unmitigated_lpe",
+            "message": (
+                f"{lpe_info['title']}: RDS module status={rds_status!r}. "
+                "Run apply-pintheft-mitigation.sh immediately and apply kernel patch."
+            ),
+            "action": "patch_urgent",
+            "cvss_score": lpe_info.get("cvss_score"),
+            "cvss_vector": lpe_info.get("cvss_vector", ""),
         }
 
     # Generic fallback: treat as observed probe, no local version data
