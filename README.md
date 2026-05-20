@@ -113,6 +113,65 @@ Redis 障害時は `IPS_REPLAY_FALLBACK_TO_MEMORY=1` の場合にメモリ退避
 ダッシュボードは XDR、SOC、EDR といった隣接プロダクトの統合パネルを表示できます。  
 公開版では「連携面の存在」だけを示し、接続先や認証情報のような実運用設定は含めていません。
 
+## 対応済み脆弱性・CVSS 情報
+
+本 IPS が現在シグネチャを保有し、スコアリングまたは自動緩和を行っている脆弱性の一覧です。
+
+| ID | 名称 | CVSS v3.1 スコア | 深刻度 | 対応方式 |
+|---|---|---|---|---|
+| CVE-PENDING-PINTHEFT | PinTheft: Linux Kernel LPE via RDS zerocopy + io_uring | 7.8 | High | 検出 + センサー自動緩和 |
+| CVE-2026-42945 | nginx Remote Code Execution | — | — | 検出 + パッチ推奨 |
+
+---
+
+### CVE-PENDING-PINTHEFT — PinTheft Linux Kernel LPE
+
+**概要**  
+Linux カーネルの RDS (Reliable Datagram Sockets) サブシステムにある `rds_message_zcopy_from_user()` の zerocopy 参照カウンタバグを、io_uring 経由で悪用するローカル権限昇格 (LPE)。  
+解放済みページを再利用して SUID バイナリのページキャッシュを汚染し、root シェルを取得する。
+
+| 項目 | 内容 |
+|---|---|
+| **公表日** | 2026-05-20 |
+| **CVE ID** | CVE-PENDING-PINTHEFT (割当待ち) |
+| **CVSS v3.1 スコア** | **7.8 (High)** |
+| **CVSS ベクター** | `CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H` |
+| **影響** | 機密性・完全性・可用性すべて High |
+| **攻撃経路** | Local (AV:L) |
+| **攻撃の複雑さ** | Low (AC:L) |
+| **必要な権限** | Low — 一般ユーザー権限で到達可能 (PR:L) |
+| **ユーザー操作** | 不要 (UI:N) |
+| **影響範囲** | Unchanged (S:U) |
+| **影響を受ける構成** | `CONFIG_RDS`, `CONFIG_RDS_TCP`, `CONFIG_IO_URING` が有効な Linux カーネル |
+| **緩和策** | `rds_tcp`, `rds` モジュールのアンロード + `/etc/modprobe.d/` ブラックリスト |
+
+**CVSS ベクター内訳**
+
+```
+CVSS:3.1/AV:L / AC:L / PR:L / UI:N / S:U / C:H / I:H / A:H
+         ^^^^   ^^^^   ^^^^   ^^^^   ^^^   ^^^   ^^^   ^^^
+         Local  Low    Low    None   Unch  High  High  High
+```
+
+**本 IPS での対応**
+
+- *検出*: シグネチャ `kernel_lpe_pintheft` ファミリーで CVSS スコアに対応した高スコアを付与。  
+  ペイロード中の `pintheft`, `rds_zcopy`, `rds_message_zcopy_from_user`, `iouring_lpe` などのヒントを多段階で照合する。
+- *自動緩和*: PinTheft イベントをインジェスト時に自動検出し、ダッシュボードが `kernel_module_blacklist` アクション (`rds_tcp,rds`) をキューイング。  
+  センサー側で `IPS_ALLOW_KERNEL_HARDENING=1` かつ `IPS_APPLY_MODE=nft` のとき、modprobe ブラックリスト書き込みと `rmmod` を自動実行する。  
+  WAF 無効状態でも緩和アクションは配信される（IP ブロックの WAF ゲートを迂回する専用パス）。
+
+---
+
+### CVE-2026-42945 — nginx Remote Code Execution
+
+| 項目 | 内容 |
+|---|---|
+| **パッチ済みバージョン** | mainline 1.31.0 以降 / stable 1.30.1 以降 |
+| **対応方式** | 本 IPS はプローブ検出時にサーバーのバージョンを照合し、脆弱/パッチ済みを判定してアクションを推奨 |
+
+---
+
 ## セキュリティ方針
 
 - 秘密情報はリポジトリに含めない
