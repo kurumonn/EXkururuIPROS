@@ -38,6 +38,11 @@ _ASSET_MATCHER_CACHE_TTL_SEC = max(
     5.0,
     min(float(os.getenv("IPS_ASSET_MATCHER_CACHE_SEC", "30") or 30.0), 300.0),
 )
+_MYTHOS_DEFENSE_SUMMARY_CACHE: dict[str, tuple[float, dict]] = {}
+_MYTHOS_DEFENSE_SUMMARY_CACHE_TTL_SEC = max(
+    1.0,
+    min(float(os.getenv("IPS_MYTHOS_SUMMARY_CACHE_SEC", "5") or 5.0), 60.0),
+)
 _DELIVERY_CHAIN_KEYWORDS = (
     "infostealer",
     "stealer",
@@ -4588,14 +4593,225 @@ def _match_workspace_asset(
     return best
 
 
+_MYTHOS_CANARY_PATHS: frozenset[str] = frozenset({
+    "/.env",
+    "/api/.env",
+    "/backend/.env",
+    "/.git/config",
+    "/admin/backup.zip",
+    "/api/internal/status",
+    "/debug/vars",
+    "/vendor/phpunit/phpunit",
+})
+_MYTHOS_CATEGORY_WEIGHTS: dict[str, int] = {
+    "canary_hit": 45,
+    "env_probe": 35,
+    "git_probe": 35,
+    "cgi_probe": 30,
+    "phpunit_probe": 30,
+    "path_traversal": 35,
+    "ssrf_probe": 35,
+    "php_rce_probe": 40,
+    "rce_probe": 35,
+    "template_injection": 30,
+    "sql_injection": 30,
+    "nosql_injection": 30,
+    "jwt_tamper": 25,
+    "http_smuggling": 35,
+    "graphql_introspection": 25,
+    "api_schema_fuzzing": 20,
+}
+
+
+def _decode_repeated(value: str, rounds: int = 3) -> tuple[str, int]:
+    current = str(value or "")
+    depth = 0
+    for _ in range(max(1, rounds)):
+        decoded = urllib.parse.unquote_plus(current)
+        if decoded == current:
+            break
+        current = decoded
+        depth += 1
+    return current, depth
+
+
+def _event_detection_blob(event: dict) -> tuple[str, str, int]:
+    raw_uri = str(
+        event.get("uri")
+        or event.get("path")
+        or event.get("request_path")
+        or event.get("url")
+        or event.get("request_url")
+        or ""
+    )
+    decoded_uri, depth = _decode_repeated(raw_uri)
+    decoded_uri = decoded_uri.replace("\\", "/")
+    lowered_uri = re.sub(r"/+", "/", decoded_uri).strip().lower()
+    if not lowered_uri.startswith("/") and not lowered_uri.startswith("http"):
+        lowered_uri = "/" + lowered_uri
+    body = " ".join(
+        str(event.get(k) or "")
+        for k in ("query", "body", "request_body", "payload", "payload_excerpt", "headers", "user_agent")
+    )
+    decoded_body, body_depth = _decode_repeated(body)
+    blob = f"{lowered_uri} {decoded_body.lower()}"
+    return lowered_uri[:3000], blob[:12000], max(depth, body_depth)
+
+
+def _classify_mythos_probe(event: dict) -> dict | None:
+    normalized_uri, blob, decode_depth = _event_detection_blob(event)
+    parsed_path = urllib.parse.urlparse(normalized_uri).path or normalized_uri.split("?", 1)[0]
+    categories: set[str] = set()
+    reasons: list[dict] = []
+
+    def add(category: str, value: str) -> None:
+        categories.add(category)
+        if len(reasons) < 12:
+            reasons.append({"category": category, "value": value[:160]})
+
+    if parsed_path in _MYTHOS_CANARY_PATHS:
+        add("canary_hit", parsed_path)
+    if "/.env" in blob:
+        add("env_probe", ".env")
+    if "/.git/config" in blob or "/.git/" in blob:
+        add("git_probe", ".git")
+    if "/cgi-bin/" in blob:
+        add("cgi_probe", "cgi-bin")
+    if "/vendor/phpunit" in blob or "phpunit" in blob:
+        add("phpunit_probe", "phpunit")
+    if "../" in blob or "..%2f" in blob or "/etc/passwd" in blob or "/bin/sh" in blob or "windows/win.ini" in blob:
+        add("path_traversal", "filesystem traversal")
+    if (
+        "169.254.169.254" in blob
+        or "metadata.google.internal" in blob
+        or "metadata/identity/oauth2/token" in blob
+        or re.search(r"(url|uri|callback|redirect|endpoint)=https?://(localhost|127\.0\.0\.1|10\.|172\.(1[6-9]|2\d|3[0-1])\.|192\.168\.)", blob)
+    ):
+        add("ssrf_probe", "metadata_or_private_url")
+    if "allow_url_include" in blob or "auto_prepend_file" in blob or "php://input" in blob:
+        add("php_rce_probe", "php stream wrapper")
+    if re.search(r"(\b(cmd|command|exec|shell|process)=|;\s*(id|whoami|uname)\b|`(id|whoami|uname)`)", blob):
+        add("rce_probe", "command execution token")
+    if "{{" in blob or "${jndi:" in blob or "${7*7}" in blob or "freemarker.template" in blob:
+        add("template_injection", "template expression")
+    if re.search(r"(\bunion\s+select\b|\binformation_schema\b|'\s*or\s*'1'\s*=\s*'1|sleep\(\s*\d+\s*\))", blob):
+        add("sql_injection", "sql token")
+    if "$where" in blob or "[$ne]" in blob or "%24ne" in blob or '"$ne"' in blob:
+        add("nosql_injection", "nosql operator")
+    if "alg=none" in blob or '"alg":"none"' in blob or "jwt" in blob and ("none" in blob or "kid=" in blob):
+        add("jwt_tamper", "jwt header/key tamper")
+    if "transfer-encoding" in blob and "content-length" in blob:
+        add("http_smuggling", "cl_te_headers")
+    if "__schema" in blob or "__type" in blob or "introspectionquery" in blob:
+        add("graphql_introspection", "graphql introspection")
+    if parsed_path.startswith("/api/") and len(categories) >= 1:
+        add("api_schema_fuzzing", "api risky probe")
+
+    if not categories:
+        return None
+
+    score = min(100, 20 + decode_depth * 6 + sum(_MYTHOS_CATEGORY_WEIGHTS.get(c, 10) for c in categories))
+    severity = "critical" if score >= 90 or "canary_hit" in categories else "high" if score >= 70 else "medium"
+    action = "block" if severity == "critical" else "challenge" if severity == "high" else "observe"
+    if "php_rce_probe" in categories or "path_traversal" in categories:
+        action = "block" if score >= 80 else action
+
+    return {
+        "profile": "IPROS-MDP",
+        "rule_id": "AI-RECON-001",
+        "normalized_uri": normalized_uri,
+        "categories": sorted(categories),
+        "score": score,
+        "severity": severity,
+        "action": action,
+        "decode_depth": decode_depth,
+        "reasons": reasons,
+        "evidence": {
+            "category_spread": len(categories),
+            "canary_hit": "canary_hit" in categories,
+            "payload_normalized": decode_depth > 0,
+        },
+    }
+
+
+def _apply_mythos_detection(event: dict) -> bool:
+    result = _classify_mythos_probe(event)
+    if not result:
+        return False
+    event["mythos_defense"] = result
+    event["normalized_uri"] = result["normalized_uri"]
+    event["request_categories"] = result["categories"]
+    for category in result["categories"]:
+        _append_event_tag(event, category)
+    _append_event_tag(event, "mythos_defense")
+    if result["evidence"].get("canary_hit"):
+        _append_event_tag(event, "canary_hit")
+    if not str(event.get("signature") or event.get("rule") or "").strip():
+        event["signature"] = "CANARY-ENV-001" if "env_probe" in result["categories"] and result["evidence"].get("canary_hit") else result["rule_id"]
+    if _severity_rank(str(event.get("severity") or "medium")) < _severity_rank(result["severity"]):
+        event["severity"] = result["severity"]
+    event["score"] = max(_to_float(event.get("score"), 0.0), float(result["score"]))
+    event["action"] = _enforce_min_action(str(event.get("action") or "alert"), result["action"])
+    return True
+
+
+def _apply_mythos_batch_correlation(events: list[dict]) -> int:
+    groups: dict[str, list[dict]] = {}
+    for event in events:
+        if not isinstance(event.get("mythos_defense"), dict):
+            continue
+        src = str(event.get("src_ip") or event.get("normalized_client_ip") or "").strip().lower()
+        if not src:
+            continue
+        groups.setdefault(src, []).append(event)
+
+    correlated = 0
+    for src, rows in groups.items():
+        categories: set[str] = set()
+        uris: set[str] = set()
+        failures = 0
+        for event in rows:
+            mdp = event.get("mythos_defense") if isinstance(event.get("mythos_defense"), dict) else {}
+            categories.update(str(x) for x in mdp.get("categories", []) if x)
+            uri = str(mdp.get("normalized_uri") or event.get("uri") or event.get("path") or "")
+            if uri:
+                uris.add(uri)
+            status = _to_int(event.get("status_code") or event.get("status"), 0)
+            if 400 <= status <= 599:
+                failures += 1
+        failure_ratio = failures / max(1, len(rows))
+        if len(uris) < 4 or len(categories) < 3 or failure_ratio < 0.5:
+            continue
+        chain_score = min(100, 65 + len(categories) * 5 + len(uris) * 2)
+        for event in rows:
+            mdp = event.setdefault("mythos_defense", {})
+            mdp["chain"] = {
+                "rule_id": "AI-RECON-CHAIN-001",
+                "src_ip": src,
+                "unique_risky_uri_count": len(uris),
+                "endpoint_category_spread": len(categories),
+                "status_4xx_5xx_ratio": round(failure_ratio, 3),
+                "score": chain_score,
+            }
+            _append_event_tag(event, "AI_EXPLOIT_CHAIN")
+            if not str(event.get("signature") or event.get("rule") or "").strip() or str(event.get("signature")).startswith("AI-RECON"):
+                event["signature"] = "AI-RECON-CHAIN-001"
+            if _severity_rank(str(event.get("severity") or "medium")) < _severity_rank("high"):
+                event["severity"] = "high"
+            event["score"] = max(_to_float(event.get("score"), 0.0), float(chain_score))
+            event["action"] = _enforce_min_action(str(event.get("action") or "alert"), "challenge")
+            correlated += 1
+    return correlated
+
+
 _PINTHEFT_SIGNATURE_HINTS: frozenset[str] = frozenset({
     "pintheft", "pin_theft", "rds_zcopy", "rds zerocopy",
     "rds_message_zcopy", "iouring_lpe", "rds_tcp lpe",
-    "kernel_lpe_pintheft",
+    "kernel_lpe_pintheft", "rds_activity", "pintheft_exposure",
 })
 _PINTHEFT_EVENT_TYPES: frozenset[str] = frozenset({
     "pintheft_lpe", "rds_lpe", "iouring_lpe", "kernel_rds_lpe",
-    "kernel_lpe_pintheft",
+    "kernel_lpe_pintheft", "kernel_exposure_snapshot", "module_load",
 })
 _PINTHEFT_LABELS: frozenset[str] = frozenset({
     "pintheft", "pintheft-lpe", "rds-lpe", "iouring-lpe", "rds-zcopy",
@@ -4613,8 +4829,72 @@ def _is_pintheft_event(event: dict) -> bool:
             return True
     event_type = str(event.get("event_type") or "").strip().lower()
     if event_type in _PINTHEFT_EVENT_TYPES:
+        if event_type == "module_load":
+            return str(event.get("module_name") or "").strip().lower() in {"rds", "rds_tcp"}
+        return True
+    if str(event.get("module_name") or "").strip().lower() in {"rds", "rds_tcp"}:
+        return True
+    if str(event.get("syscall") or "").strip().lower().startswith("io_uring") and (
+        str(event.get("rds_loaded") or "").strip().lower() in {"1", "true", "yes"}
+        or str(event.get("rds_tcp_loaded") or "").strip().lower() in {"1", "true", "yes"}
+    ):
         return True
     return False
+
+
+def _apply_pintheft_detection(event: dict) -> bool:
+    if not _is_pintheft_event(event):
+        return False
+    event_type = str(event.get("event_type") or "").strip().lower()
+    module_name = str(event.get("module_name") or "").strip().lower()
+    io_raw = event.get("io_uring_disabled")
+    io_uring_disabled = "" if io_raw is None else str(io_raw).strip().lower()
+    suid_count = _to_int(event.get("suid_binary_count"), 0)
+    rds_loaded = str(event.get("rds_loaded") or "").strip().lower() in {"1", "true", "yes"}
+    rds_tcp_loaded = str(event.get("rds_tcp_loaded") or "").strip().lower() in {"1", "true", "yes"}
+
+    rule_id = "PINTHEFT-SIGNAL-001"
+    severity = "high"
+    score = 80
+    evidence = {
+        "event_type": event_type,
+        "module_name": module_name,
+        "rds_loaded": rds_loaded,
+        "rds_tcp_loaded": rds_tcp_loaded,
+        "io_uring_disabled": io_uring_disabled,
+        "suid_binary_count": suid_count,
+    }
+    if event_type == "kernel_exposure_snapshot" and (rds_loaded or rds_tcp_loaded) and io_uring_disabled in {"0", "false"} and suid_count > 0:
+        rule_id = "PINTHEFT-EXPOSURE-001"
+        severity = "critical"
+        score = 95
+    elif event_type == "module_load" and module_name in {"rds", "rds_tcp"}:
+        rule_id = "PINTHEFT-RDS-LOAD-001"
+        severity = "critical"
+        score = 95
+    elif str(event.get("syscall") or "").strip().lower().startswith("io_uring"):
+        rule_id = "PINTHEFT-IOURING-RDS-CHAIN-001"
+        severity = "critical"
+        score = 92
+
+    event["pintheft_defense"] = {
+        "profile": "PDP-001",
+        "rule_id": rule_id,
+        "score": score,
+        "severity": severity,
+        "action": "kernel_module_blacklist",
+        "target": "rds_tcp,rds",
+        "evidence": evidence,
+    }
+    _append_event_tag(event, "pintheft_defense")
+    _append_event_tag(event, "kernel_lpe")
+    if not str(event.get("signature") or event.get("rule") or "").strip():
+        event["signature"] = rule_id
+    if _severity_rank(str(event.get("severity") or "medium")) < _severity_rank(severity):
+        event["severity"] = severity
+    event["score"] = max(_to_float(event.get("score"), 0.0), float(score))
+    event["action"] = _enforce_min_action(str(event.get("action") or "alert"), "block")
+    return True
 
 
 def _auto_enqueue_pintheft_mitigation(workspace_slug: str, conn: sqlite3.Connection) -> bool:
@@ -4655,6 +4935,28 @@ def _auto_enqueue_pintheft_mitigation(workspace_slug: str, conn: sqlite3.Connect
             "PinTheft LPE auto-mitigation: RDS zerocopy refcount bug via io_uring (CVE-PENDING-PINTHEFT)",
             now.isoformat(),
             expires_at,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO policy_audit_logs (
+          workspace_slug, action, actor, policy_id, target_type, target_value,
+          detail_json, outcome, ip_address, created_at
+        )
+        VALUES (?, 'kernel_hardening_queued', 'system', 'PDP-001',
+                'kernel_module_blacklist', 'rds_tcp,rds', ?, 'ok', '', ?)
+        """,
+        (
+            workspace_slug,
+            json.dumps(
+                {
+                    "reason": "PINTHEFT-EXPOSURE-001",
+                    "ttl_seconds": ttl_sec,
+                    "mitigation": "blacklist rds_tcp,rds",
+                },
+                ensure_ascii=False,
+            ),
+            now.isoformat(),
         ),
     )
     return True
@@ -4880,6 +5182,8 @@ def insert_security_events(workspace_slug: str, sensor_id: str, events: list[dic
                 event["action"] = _enforce_min_action(str(event.get("action") or action), "limit")
             elif match_score >= 75:
                 event["action"] = _enforce_min_action(str(event.get("action") or action), "challenge")
+        _apply_mythos_detection(event)
+        _apply_pintheft_detection(event)
         severity = str(event.get("severity") or severity).strip().lower()
         action = str(event.get("action") or action).strip().lower()
         # Defensive default: high-risk high-severity detections should not remain allow/observe.
@@ -4891,6 +5195,7 @@ def insert_security_events(workspace_slug: str, sensor_id: str, events: list[dic
             event["action"] = "observe"
             event.setdefault("auto_adjust_reason", "low_severity_fp_guard")
         prepared.append(event)
+    mythos_chain_hits = _apply_mythos_batch_correlation(prepared)
     flow_result = _analyze_flow_signals(prepared)
     source_keys = sorted(
         {
@@ -4974,11 +5279,111 @@ def insert_security_events(workspace_slug: str, sensor_id: str, events: list[dic
         "threat_intel_live_lookups": live_lookups,
         "flow_anomaly_hits": int(flow_result.get("event_hits") or 0),
         "flow_signal_counts": flow_result.get("signal_counts") or {},
+        "mythos_chain_hits": mythos_chain_hits,
         "flow_rows": flow_rows,
         "latency_rows": latency_rows,
         "incident_result": incident_result,
         "pintheft_queued": pintheft_queued,
     }
+
+
+def mythos_defense_summary(workspace_slug: str, hours: int = 24) -> dict:
+    cache_key = f"{workspace_slug}:{hours}"
+    now_mono = time.monotonic()
+    cached = _MYTHOS_DEFENSE_SUMMARY_CACHE.get(cache_key)
+    if cached and (now_mono - float(cached[0])) < _MYTHOS_DEFENSE_SUMMARY_CACHE_TTL_SEC:
+        return dict(cached[1])
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=max(1, min(int(hours), 168)))).isoformat()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT
+              COUNT(*) AS suspected_ai_probe_events,
+              SUM(CASE WHEN raw_event LIKE '%AI_EXPLOIT_CHAIN%' THEN 1 ELSE 0 END) AS chain_events,
+              SUM(CASE WHEN raw_event LIKE '%canary_hit%' THEN 1 ELSE 0 END) AS canary_hits,
+              SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END) AS critical_events,
+              SUM(CASE WHEN action IN ('block','deny','drop','reject','waf_block','403') THEN 1 ELSE 0 END) AS blocked_events
+            FROM security_events
+            WHERE workspace_slug = ?
+              AND detected_at >= ?
+              AND (signature LIKE 'AI-%' OR signature LIKE 'CANARY-%' OR raw_event LIKE '%"mythos_defense"%')
+            """,
+            (workspace_slug, since),
+        ).fetchone()
+        family_rows = conn.execute(
+            """
+            SELECT signature, COUNT(*) AS hits, MAX(severity) AS severity
+            FROM security_events
+            WHERE workspace_slug = ?
+              AND detected_at >= ?
+              AND (signature LIKE 'AI-%' OR signature LIKE 'CANARY-%' OR raw_event LIKE '%"mythos_defense"%')
+            GROUP BY signature
+            ORDER BY hits DESC, signature ASC
+            LIMIT 10
+            """,
+            (workspace_slug, since),
+        ).fetchall()
+        vp_row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM block_actions
+            WHERE workspace_slug = ?
+              AND status IN ('pending','sent','applied')
+              AND (reason LIKE '%virtual%' OR reason LIKE '%Mythos%' OR reason LIKE '%AI probe%')
+            """,
+            (workspace_slug,),
+        ).fetchone()
+        pin_row = conn.execute(
+            """
+            SELECT
+              COUNT(*) AS events,
+              SUM(CASE WHEN raw_event LIKE '%PINTHEFT-EXPOSURE-001%' THEN 1 ELSE 0 END) AS exposure_events,
+              SUM(CASE WHEN raw_event LIKE '%PINTHEFT-RDS-LOAD-001%' THEN 1 ELSE 0 END) AS rds_load_events
+            FROM security_events
+            WHERE workspace_slug = ?
+              AND detected_at >= ?
+              AND (signature LIKE 'PINTHEFT-%' OR raw_event LIKE '%"pintheft_defense"%')
+            """,
+            (workspace_slug, since),
+        ).fetchone()
+        hardening_row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM block_actions
+            WHERE workspace_slug = ?
+              AND target_type = 'kernel_module_blacklist'
+              AND target_value = 'rds_tcp,rds'
+              AND status IN ('pending','sent','applied')
+            """,
+            (workspace_slug,),
+        ).fetchone()
+
+    suspected = int(row["suspected_ai_probe_events"] or 0) if row else 0
+    chains = int(row["chain_events"] or 0) if row else 0
+    critical = int(row["critical_events"] or 0) if row else 0
+    risk_level = "critical" if critical > 0 else "high" if chains > 0 else "elevated" if suspected > 0 else "normal"
+    payload = {
+        "profile": "IPROS-MDP",
+        "window_hours": hours,
+        "risk_level": risk_level,
+        "suspected_ai_probe_events": suspected,
+        "suspected_ai_probe_chains": chains,
+        "canary_hits": int(row["canary_hits"] or 0) if row else 0,
+        "critical_events": critical,
+        "blocked_events": int(row["blocked_events"] or 0) if row else 0,
+        "virtual_patches_active": int(vp_row["c"] or 0) if vp_row else 0,
+        "top_attack_families": [dict(r) for r in family_rows],
+        "pintheft": {
+            "profile": "PDP-001",
+            "events": int(pin_row["events"] or 0) if pin_row else 0,
+            "exposure_events": int(pin_row["exposure_events"] or 0) if pin_row else 0,
+            "rds_load_events": int(pin_row["rds_load_events"] or 0) if pin_row else 0,
+            "kernel_hardening_actions_active": int(hardening_row["c"] or 0) if hardening_row else 0,
+        },
+    }
+    _MYTHOS_DEFENSE_SUMMARY_CACHE[cache_key] = (now_mono, dict(payload))
+    return payload
 
 
 def upsert_metrics(aggregated: dict) -> None:
@@ -5346,6 +5751,7 @@ def dashboard_summary() -> dict:
     ti_active_count = count_threat_intel_entries(active_only=True)
     ti_recent_matches = list_recent_threat_intel_matches(default_workspace, limit=30)
     flow_summary = list_flow_findings_summary(default_workspace, hours=24, limit=20)
+    mythos_summary = mythos_defense_summary(default_workspace, hours=24)
     ti_providers_live = []
     if str(os.getenv("ABUSEIPDB_API_KEY", "")).strip():
         ti_providers_live.append("abuseipdb")
@@ -5446,6 +5852,7 @@ def dashboard_summary() -> dict:
             "recent_matches": ti_recent_matches,
         },
         "flow_analysis_24h": flow_summary,
+        "mythos_defense": mythos_summary,
     }
     _DASHBOARD_SUMMARY_CACHE["at"] = now_mono
     _DASHBOARD_SUMMARY_CACHE["data"] = dict(payload)

@@ -119,8 +119,23 @@ Redis 障害時は `IPS_REPLAY_FALLBACK_TO_MEMORY=1` の場合にメモリ退避
 
 | ID | 名称 | CVSS v3.1 スコア | 深刻度 | 対応方式 |
 |---|---|---|---|---|
+| IPROS-MDP | Mythos 型 AI-assisted exploit probe | — | High/Critical | 正規化 + 相関検知 + Canary + Evidence |
 | CVE-PENDING-PINTHEFT | PinTheft: Linux Kernel LPE via RDS zerocopy + io_uring | 7.8 | High | 検出 + センサー自動緩和 |
 | CVE-2026-42945 | nginx Remote Code Execution | — | — | 検出 + パッチ推奨 |
+
+---
+
+### IPROS-MDP — Mythos Defense Profile
+
+Mythos は固定IoCではなく、AI支援で高速化する脆弱性探索・多段プローブのTTPとして扱う。
+
+**本 IPS での対応**
+
+- *正規化*: URL二重エンコード、パス表記ゆれ、クエリ/本文断片を正規化して `normalized_uri` と `request_categories` を付与。
+- *検出*: `.env`, `.git`, `cgi-bin`, PHP RCE, traversal, SSRF, SQL/NoSQL injection, GraphQL introspection, request smuggling をカテゴリ化。
+- *Canary*: `/.env`, `/.git/config`, `/api/internal/status`, `/debug/vars` などの honey URI を `canary_hit` として critical 扱い。
+- *相関*: 同一送信元が短時間に複数カテゴリ・複数URI・4xx/5xx中心で探索した場合、`AI-RECON-CHAIN-001` として `AI_EXPLOIT_CHAIN` を付与。
+- *API*: `GET /api/v1/workspaces/{workspace}/mythos-defense/summary/` で Mythos/PinTheft 防御サマリを返す。
 
 ---
 
@@ -156,10 +171,11 @@ CVSS:3.1/AV:L / AC:L / PR:L / UI:N / S:U / C:H / I:H / A:H
 **本 IPS での対応**
 
 - *検出*: シグネチャ `kernel_lpe_pintheft` ファミリーで CVSS スコアに対応した高スコアを付与。  
-  ペイロード中の `pintheft`, `rds_zcopy`, `rds_message_zcopy_from_user`, `iouring_lpe` などのヒントを多段階で照合する。
+  ペイロード中の `pintheft`, `rds_zcopy`, `rds_message_zcopy_from_user`, `iouring_lpe` などのヒントに加え、EDRイベント `kernel_exposure_snapshot`, `module_load`, `io_uring_*` を照合する。
 - *自動緩和*: PinTheft イベントをインジェスト時に自動検出し、ダッシュボードが `kernel_module_blacklist` アクション (`rds_tcp,rds`) をキューイング。  
   センサー側で `IPS_ALLOW_KERNEL_HARDENING=1` かつ `IPS_APPLY_MODE=nft` のとき、modprobe ブラックリスト書き込みと `rmmod` を自動実行する。  
   WAF 無効状態でも緩和アクションは配信される（IP ブロックの WAF ゲートを迂回する専用パス）。
+- *監査*: 自動緩和キュー投入時に `policy_audit_logs` へ `kernel_hardening_queued` を記録する。
 
 ---
 

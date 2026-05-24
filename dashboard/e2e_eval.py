@@ -307,3 +307,18 @@ def _e2e_regressions(current: dict, previous: dict | None) -> list[str]:
     if _to_float(current.get("attack_chain_visibility_rate"), 0.0) + 1e-9 < _to_float(previous.get("attack_chain_visibility_rate"), 0.0):
         issues.append("attack_chain_visibility_down")
     return issues
+
+
+# Public aliases consumed by dashboard.app. Keep underscore implementations for
+# backward-compatible internal imports while exposing stable module API names.
+bucket_5m_utc = _bucket_5m_utc
+e2e_profile_defaults = _e2e_profile_defaults
+e2e_regressions = _e2e_regressions
+evaluate_action_latency_breaches = _evaluate_action_latency_breaches
+evaluate_e2e_events = _evaluate_e2e_events
+extract_latency_ms = _extract_latency_ms
+is_blocked = _is_blocked
+is_mitigated = _is_mitigated
+percentile = _percentile
+scenario_class = _scenario_class
+to_float = _to_float

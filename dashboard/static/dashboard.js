@@ -434,6 +434,24 @@
       { stage: "multi_sensor_incidents", count: multi.recent_multi_sensor_incidents || 0, rate: multi.recent_multi_sensor_rate || 0 },
     ];
     fillRows("socChainBody", "socChainEmpty", chainRows, (row) => `<tr><td>${row.stage}</td><td class="num">${fmtInt(row.count)}</td><td class="num">${fmtPct(row.rate)}</td></tr>`);
+    const mythos = data.mythos_defense || {};
+    const pin = mythos.pintheft || {};
+    const mythosRows = [
+      { item: "risk_level", value: mythos.risk_level || "normal", note: `profile=${mythos.profile || "IPROS-MDP"}` },
+      { item: "suspected_ai_probe_events", value: mythos.suspected_ai_probe_events || 0, note: "normalized exploit probes" },
+      { item: "suspected_ai_probe_chains", value: mythos.suspected_ai_probe_chains || 0, note: "AI_EXPLOIT_CHAIN correlated events" },
+      { item: "canary_hits", value: mythos.canary_hits || 0, note: "honey URI access" },
+      { item: "blocked_events", value: mythos.blocked_events || 0, note: "block/deny/drop decisions" },
+      { item: "pintheft_events", value: pin.events || 0, note: `profile=${pin.profile || "PDP-001"}` },
+      { item: "pintheft_exposure_events", value: pin.exposure_events || 0, note: "RDS + io_uring + SUID exposure" },
+      { item: "kernel_hardening_actions", value: pin.kernel_hardening_actions_active || 0, note: "active rds_tcp,rds blacklist actions" },
+    ];
+    fillRows(
+      "mythosDefenseBody",
+      "mythosDefenseEmpty",
+      mythosRows,
+      (row) => `<tr><td>${row.item}</td><td class="num">${typeof row.value === "number" ? fmtInt(row.value) : row.value}</td><td>${row.note}</td></tr>`
+    );
     const stack = (data.integration && data.integration.stack) || {};
     const remoteStatus = stack.xdr_remote_action_status || {};
     const stackRows = [

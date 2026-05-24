@@ -94,6 +94,7 @@ from .storage import (
     list_rule_feedback_stats,
     list_rule_overrides,
     list_sensors_summary,
+    mythos_defense_summary,
     list_threat_intel_entries,
     list_threat_intel_sync_runs,
     lookup_threat_intel_ip_all,
@@ -1535,6 +1536,10 @@ async def _dispatch(scope, method: str, path: str, body: bytes):
         return _static_response(path)
     if method == "GET" and path == "/api/v1/dashboard/summary/":
         return _json_response(_dashboard_summary_with_stack_panel())
+    m = re.fullmatch(r"/api/v1/workspaces/([^/]+)/mythos-defense/summary/?", path)
+    if method == "GET" and m:
+        workspace_slug = m.group(1)
+        return _json_response({"ok": True, "summary": mythos_defense_summary(workspace_slug, hours=24)})
     if method == "GET" and path == "/api/v1/metrics/prometheus":
         return _text_response(_prometheus_metrics(dashboard_summary()), 200, b"text/plain; version=0.0.4; charset=utf-8")
 
