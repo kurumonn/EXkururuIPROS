@@ -81,6 +81,7 @@ Vulnerabilities for which this IPS currently holds detection signatures, scoring
 | ID | Name | CVSS v3.1 Score | Severity | Response |
 |---|---|---|---|---|
 | CVE-PENDING-PINTHEFT | PinTheft: Linux Kernel LPE via RDS zerocopy + io_uring | 7.8 | High | Detect + Sensor auto-remediation |
+| CVE-2026-49975 | HTTP/2 Bomb: HPACK table amplification + Slowloris-style hold (L7 DoS) | 7.5 | High | Detect + source-IP auto-mitigation |
 | CVE-2026-42945 | nginx Remote Code Execution | — | — | Detect + patch recommendation |
 
 ---
@@ -121,6 +122,46 @@ CVSS:3.1/AV:L / AC:L / PR:L / UI:N / S:U / C:H / I:H / A:H
 - *Auto-remediation*: PinTheft events are detected at ingest time. The dashboard automatically queues a `kernel_module_blacklist` action targeting `rds_tcp,rds`.  
   When the sensor runs with `IPS_ALLOW_KERNEL_HARDENING=1` and `IPS_APPLY_MODE=nft`, it writes the modprobe blacklist and runs `rmmod` automatically.  
   The remediation action is delivered even when the WAF is disabled — it uses a dedicated path that bypasses the IP-block WAF gate.
+
+---
+
+### CVE-2026-49975 — HTTP/2 Bomb (L7 DoS)
+
+**Summary**  
+A remote denial-of-service against HTTP/2 servers. The attacker seeds the HPACK header compression
+table with a single large header entry, then sends thousands of single-byte indexed references back
+to that entry, forcing the server to reconstruct and hold huge header sets on every request. Combined
+with Slowloris-style connection holding, this exhausts server memory. No authentication is required; a
+single client can consume ~32GB on Apache httpd / Envoy in roughly 20 seconds. Affects nginx, Apache
+httpd, Microsoft IIS, Envoy, and Cloudflare Pingora.
+
+| Field | Value |
+|---|---|
+| **Disclosed** | 2026-06-03 (coordinated) |
+| **CVE ID** | CVE-2026-49975 |
+| **CVSS v3.1 Score** | **7.5 (High)** |
+| **CVSS Vector** | `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H` |
+| **Impact** | Availability only — High (remote DoS) |
+| **Attack Vector** | Network (AV:N) |
+| **Privileges Required / User Interaction** | None (PR:N / UI:N) |
+| **Affected configurations** | nginx / Apache httpd / IIS / Envoy / Cloudflare Pingora with HTTP/2 enabled |
+| **Mitigation** | Cap header count and HPACK table size, apply vendor patches, block the source |
+
+**How this IPS responds**
+
+- *Detection*: Classified from sensor-supplied HTTP/2 telemetry (`header_count`, `hpack_indexed_ref_count`,
+  `largest_header_bytes`, `hpack_table_bytes`, `decoded_header_bytes`, `amplification_ratio`,
+  `connection_duration_sec`, `conn_mem_bytes`) into `header_ref_flood`, `hpack_table_seeded`,
+  `decompression_amplification`, `memory_exhaustion`, and `slowloris_hold` signals. Detection is based on
+  protocol behavior rather than URI patterns, so amplification hidden inside otherwise-normal encrypted
+  requests is still caught.
+- *Signatures*: `HTTP2-BOMB-HPACK-001` (confirmed HPACK amplification) / `HTTP2-BOMB-SLOWLORIS-001`
+  (hold-based) / `HTTP2-BOMB-001` (composite) / `HTTP2-BOMB-SIGNAL-001` (single signal). Profile `H2DP-001`.
+  Thresholds are overridable via `IPS_H2_*` environment variables (e.g. `IPS_H2_HEADER_COUNT_FLOOD`).
+- *Auto-mitigation*: Queues an `ip` block action against the source, honoring the WAF gate and deduping
+  within 24 hours. Each queue insert is recorded to `policy_audit_logs` as `http2_bomb_mitigation_queued`.
+- *API*: The `GET /api/v1/workspaces/{workspace}/mythos-defense/summary/` response includes an
+  `http2_bomb` rollup (events / critical_events / ip_block_actions_active).
 
 ---
 

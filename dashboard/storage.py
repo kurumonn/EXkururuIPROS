@@ -1206,6 +1206,9 @@ def _signature_family(signature: str) -> str:
     # Kernel LPE / PinTheft (2026-05-20): RDS zerocopy refcount bug via io_uring
     if any(t in s for t in ("kernel_lpe", "pintheft", "_lpe", "privilege_escalation")):
         return "kernel_lpe"
+    # HTTP/2 Bomb L7 DoS (CVE-2026-49975, 2026-06-03): HPACK amplification + Slowloris hold
+    if any(t in s for t in ("http2-bomb", "http2_bomb", "hpack", "h2_bomb", "h2-bomb")):
+        return "http2_bomb"
     token = s.replace(":", "-").split("-", 1)[0]
     return token[:32] if token else "generic"
 
@@ -1234,6 +1237,11 @@ def _is_high_risk_signature(signature: str) -> bool:
         "privilege_escalation",
         "kernel_exploit",
         "iouring_abuse",
+        # HTTP/2 Bomb L7 DoS (CVE-2026-49975, 2026-06-03)
+        "http2-bomb",
+        "http2_bomb",
+        "hpack",
+        "bomb",
     )
     return any(k in s for k in keywords)
 
@@ -4962,6 +4970,277 @@ def _auto_enqueue_pintheft_mitigation(workspace_slug: str, conn: sqlite3.Connect
     return True
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# HTTP/2 Bomb (CVE-2026-49975) detection
+#   L7 DoS combining HPACK compression-table amplification with Slowloris-style
+#   connection holding: a single large header entry is seeded into the HPACK
+#   dynamic table, then thousands of single-byte indexed references force the
+#   server to reconstruct (and hold) huge header sets while the connection is
+#   kept open until memory is exhausted (~32GB in ~20s on Apache/Envoy).
+#   Detected from sensor-supplied HTTP/2 telemetry, not URI patterns.
+#   Ref: https://nvd.nist.gov/vuln/detail/CVE-2026-49975
+# ──────────────────────────────────────────────────────────────────────────────
+_HTTP2_BOMB_SIGNATURE_HINTS: frozenset[str] = frozenset({
+    "http2_bomb", "http2-bomb", "h2_bomb", "h2-bomb", "hpack_bomb", "hpack-bomb",
+    "http2_header_flood", "h2_header_flood", "hpack_amplification",
+    "cve-2026-49975", "cve_2026_49975",
+})
+_HTTP2_BOMB_EVENT_TYPES: frozenset[str] = frozenset({
+    "http2_bomb", "h2_bomb", "hpack_amplification", "hpack_bomb",
+    "http2_header_flood", "h2_header_flood", "h2_slowloris",
+})
+_HTTP2_BOMB_LABELS: frozenset[str] = frozenset({
+    "http2-bomb", "h2-bomb", "hpack-bomb", "cve-2026-49975",
+})
+_HTTP2_VERSION_TOKENS: frozenset[str] = frozenset({
+    "2", "2.0", "h2", "h2c", "http/2", "http/2.0", "http2",
+})
+
+
+def _h2_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(str(os.getenv(name, "") or "").strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+# Thresholds (env-overridable). Defaults are sized so well-behaved HTTP/2 clients
+# never trip them; the HTTP/2 Bomb operates well above each limit.
+_H2_HEADER_COUNT_FLOOD = _h2_int_env("IPS_H2_HEADER_COUNT_FLOOD", 1000)
+_H2_INDEXED_REF_FLOOD = _h2_int_env("IPS_H2_INDEXED_REF_FLOOD", 2000)
+_H2_LARGE_HEADER_BYTES = _h2_int_env("IPS_H2_LARGE_HEADER_BYTES", 16384)
+_H2_HPACK_TABLE_LARGE_BYTES = _h2_int_env("IPS_H2_HPACK_TABLE_BYTES", 65536)
+_H2_DECODED_HEADER_BYTES_HUGE = _h2_int_env("IPS_H2_DECODED_HEADER_BYTES", 1048576)
+_H2_AMPLIFICATION_RATIO = _h2_int_env("IPS_H2_AMPLIFICATION_RATIO", 100)
+_H2_SLOWLORIS_HOLD_SEC = _h2_int_env("IPS_H2_SLOWLORIS_HOLD_SEC", 30)
+_H2_CONN_MEM_BYTES = _h2_int_env("IPS_H2_CONN_MEM_BYTES", 256 * 1024 * 1024)
+
+
+def _event_is_http2(event: dict) -> bool:
+    for key in ("http_version", "protocol_version", "negotiated_protocol", "alpn", "alpn_protocol"):
+        value = str(event.get(key) or "").strip().lower()
+        if not value:
+            continue
+        if value in _HTTP2_VERSION_TOKENS or value.startswith("h2") or "http/2" in value:
+            return True
+    if str(event.get("is_http2") or event.get("http2") or "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    return False
+
+
+def _h2_num(event: dict, keys: tuple[str, ...]) -> float:
+    for key in keys:
+        val = event.get(key)
+        if val is not None and str(val).strip() != "":
+            return _to_float(val, 0.0)
+    return 0.0
+
+
+def _http2_bomb_signals(event: dict) -> tuple[set[str], dict]:
+    header_count = _h2_num(event, ("header_count", "request_header_count", "h2_header_count", "decoded_header_count"))
+    indexed_refs = _h2_num(event, ("hpack_indexed_ref_count", "hpack_indexed_field_count", "indexed_header_refs", "hpack_ref_count"))
+    largest_header = _h2_num(event, ("largest_header_bytes", "max_header_entry_bytes", "hpack_largest_entry_bytes"))
+    table_bytes = _h2_num(event, ("hpack_table_bytes", "hpack_dynamic_table_bytes", "hpack_table_size"))
+    decoded_bytes = _h2_num(event, ("decoded_header_bytes", "reconstructed_header_bytes", "header_decompressed_bytes"))
+    amp_ratio = _h2_num(event, ("hpack_amplification_ratio", "header_amplification_ratio", "amplification_ratio"))
+    conn_dur = _h2_num(event, ("connection_duration_sec", "conn_duration_sec", "connection_age_sec"))
+    conn_mem = _h2_num(event, ("conn_mem_bytes", "connection_memory_bytes", "held_memory_bytes"))
+
+    signals: set[str] = set()
+    if header_count >= _H2_HEADER_COUNT_FLOOD or indexed_refs >= _H2_INDEXED_REF_FLOOD:
+        signals.add("header_ref_flood")
+    if table_bytes >= _H2_HPACK_TABLE_LARGE_BYTES or largest_header >= _H2_LARGE_HEADER_BYTES:
+        signals.add("hpack_table_seeded")
+    if decoded_bytes >= _H2_DECODED_HEADER_BYTES_HUGE or amp_ratio >= _H2_AMPLIFICATION_RATIO:
+        signals.add("decompression_amplification")
+    if conn_mem >= _H2_CONN_MEM_BYTES:
+        signals.add("memory_exhaustion")
+    if conn_dur >= _H2_SLOWLORIS_HOLD_SEC and (
+        conn_mem > 0 or header_count >= _H2_HEADER_COUNT_FLOOD or indexed_refs >= _H2_INDEXED_REF_FLOOD
+    ):
+        signals.add("slowloris_hold")
+
+    evidence = {
+        "http2": True,
+        "header_count": int(header_count),
+        "hpack_indexed_ref_count": int(indexed_refs),
+        "largest_header_bytes": int(largest_header),
+        "hpack_table_bytes": int(table_bytes),
+        "decoded_header_bytes": int(decoded_bytes),
+        "amplification_ratio": round(amp_ratio, 2),
+        "connection_duration_sec": round(conn_dur, 2),
+        "conn_mem_bytes": int(conn_mem),
+    }
+    return signals, evidence
+
+
+def _is_http2_bomb_event(event: dict) -> bool:
+    sig = str(event.get("signature") or event.get("rule") or "").strip().lower()
+    if any(h in sig for h in _HTTP2_BOMB_SIGNATURE_HINTS):
+        return True
+    labels = event.get("labels") or event.get("tags") or []
+    if isinstance(labels, list) and {str(x).strip().lower() for x in labels} & _HTTP2_BOMB_LABELS:
+        return True
+    if str(event.get("event_type") or "").strip().lower() in _HTTP2_BOMB_EVENT_TYPES:
+        return True
+    if not _event_is_http2(event):
+        return False
+    signals, _ = _http2_bomb_signals(event)
+    return bool(signals)
+
+
+def _apply_http2_bomb_detection(event: dict) -> bool:
+    if not _is_http2_bomb_event(event):
+        return False
+    signals, evidence = _http2_bomb_signals(event)
+    sig_lower = str(event.get("signature") or event.get("rule") or "").strip().lower()
+    explicit = (
+        any(h in sig_lower for h in _HTTP2_BOMB_SIGNATURE_HINTS)
+        or str(event.get("event_type") or "").strip().lower() in _HTTP2_BOMB_EVENT_TYPES
+    )
+
+    rule_id = "HTTP2-BOMB-SIGNAL-001"
+    severity = "high"
+    score = 80
+    if (
+        "memory_exhaustion" in signals
+        or {"header_ref_flood", "hpack_table_seeded"} <= signals
+        or {"header_ref_flood", "decompression_amplification"} <= signals
+    ):
+        rule_id = "HTTP2-BOMB-HPACK-001"
+        severity = "critical"
+        score = 96
+    elif "slowloris_hold" in signals and ("header_ref_flood" in signals or "hpack_table_seeded" in signals):
+        rule_id = "HTTP2-BOMB-SLOWLORIS-001"
+        severity = "critical"
+        score = 94
+    elif len(signals) >= 2:
+        rule_id = "HTTP2-BOMB-001"
+        severity = "critical"
+        score = 92
+    elif explicit and not signals:
+        rule_id = "HTTP2-BOMB-001"
+        severity = "high"
+        score = 82
+
+    event["http2_bomb_defense"] = {
+        "profile": "H2DP-001",
+        "rule_id": rule_id,
+        "cve": "CVE-2026-49975",
+        "score": score,
+        "severity": severity,
+        "action": "block" if severity == "critical" else "rate_limit",
+        "target": "src_ip",
+        "signals": sorted(signals),
+        "evidence": evidence,
+        "mitigation": (
+            "Block/rate-limit source; cap HTTP/2 header count & HPACK table "
+            "(nginx large_client_header_buffers / http2_max_concurrent_streams; "
+            "apply Apache httpd 2026-05-27 patch)."
+        ),
+    }
+    _append_event_tag(event, "http2_bomb")
+    _append_event_tag(event, "cve_2026_49975")
+    _append_event_tag(event, "l7_dos")
+    for category in signals:
+        _append_event_tag(event, category)
+    if not str(event.get("signature") or event.get("rule") or "").strip():
+        event["signature"] = rule_id
+    if _severity_rank(str(event.get("severity") or "medium")) < _severity_rank(severity):
+        event["severity"] = severity
+    event["score"] = max(_to_float(event.get("score"), 0.0), float(score))
+    event["action"] = _enforce_min_action(
+        str(event.get("action") or "alert"),
+        "block" if severity == "critical" else "limit",
+    )
+    return True
+
+
+def _auto_enqueue_http2_bomb_mitigation(
+    workspace_slug: str, conn: sqlite3.Connection, src_ips: list[str]
+) -> int:
+    """Queue per-source-IP block/rate-limit actions for HTTP/2 Bomb (CVE-2026-49975).
+
+    Respects the workspace WAF gate (status 'pending' when enabled, 'canceled'
+    otherwise, mirroring create_block_action) and dedups per IP within 24h.
+    Returns the number of newly enqueued actions.
+    """
+    waf_enabled = bool(get_workspace_setting(workspace_slug).get("waf_enabled"))
+    status = "pending" if waf_enabled else "canceled"
+    now = datetime.now(timezone.utc)
+    acknowledged_at = None if waf_enabled else now.isoformat()
+    dedup_window_start = (now - timedelta(hours=24)).isoformat()
+    ttl_sec = 3600
+    expires_at = (now + timedelta(seconds=ttl_sec)).isoformat()
+    response_meta = json.dumps({} if waf_enabled else {"reason": "waf_disabled"}, ensure_ascii=False)
+    queued = 0
+    for src_ip in src_ips:
+        ip = str(src_ip or "").strip().lower()
+        if not ip:
+            continue
+        existing = conn.execute(
+            """
+            SELECT id FROM block_actions
+            WHERE workspace_slug = ? AND target_type = 'ip' AND target_value = ?
+              AND reason LIKE 'HTTP2-BOMB%'
+              AND status IN ('pending', 'sent', 'applied')
+              AND created_at >= ?
+            LIMIT 1
+            """,
+            (workspace_slug, ip, dedup_window_start),
+        ).fetchone()
+        if existing:
+            continue
+        conn.execute(
+            """
+            INSERT INTO block_actions (
+              workspace_slug, sensor_id, target_type, target_value, stage, ttl_seconds, reason, status,
+              created_at, expires_at, acknowledged_at, response_meta
+            )
+            VALUES (?, NULL, 'ip', ?, 'block', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                workspace_slug,
+                ip,
+                ttl_sec,
+                "HTTP2-BOMB auto-mitigation: HTTP/2 Bomb HPACK amplification DoS (CVE-2026-49975)",
+                status,
+                now.isoformat(),
+                expires_at,
+                acknowledged_at,
+                response_meta,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO policy_audit_logs (
+              workspace_slug, action, actor, policy_id, target_type, target_value,
+              detail_json, outcome, ip_address, created_at
+            )
+            VALUES (?, 'http2_bomb_mitigation_queued', 'system', 'H2DP-001',
+                    'ip', ?, ?, ?, ?, ?)
+            """,
+            (
+                workspace_slug,
+                ip,
+                json.dumps(
+                    {
+                        "reason": "CVE-2026-49975",
+                        "ttl_seconds": ttl_sec,
+                        "mitigation": "block source ip",
+                        "waf_enabled": waf_enabled,
+                    },
+                    ensure_ascii=False,
+                ),
+                "ok" if waf_enabled else "skipped_waf_disabled",
+                ip,
+                now.isoformat(),
+            ),
+        )
+        queued += 1
+    return queued
+
+
 def insert_security_events(workspace_slug: str, sensor_id: str, events: list[dict]) -> dict:
     accepted = 0
     skipped = 0
@@ -5184,6 +5463,7 @@ def insert_security_events(workspace_slug: str, sensor_id: str, events: list[dic
                 event["action"] = _enforce_min_action(str(event.get("action") or action), "challenge")
         _apply_mythos_detection(event)
         _apply_pintheft_detection(event)
+        _apply_http2_bomb_detection(event)
         severity = str(event.get("severity") or severity).strip().lower()
         action = str(event.get("action") or action).strip().lower()
         # Defensive default: high-risk high-severity detections should not remain allow/observe.
@@ -5271,6 +5551,17 @@ def insert_security_events(workspace_slug: str, sensor_id: str, events: list[dic
         with connect() as conn:
             if _auto_enqueue_pintheft_mitigation(workspace_slug, conn):
                 pintheft_queued = 1
+    http2_bomb_queued = 0
+    h2_bomb_ips = sorted(
+        {
+            str(e.get("src_ip") or "").strip().lower()
+            for e in accepted_events
+            if isinstance(e.get("http2_bomb_defense"), dict) and str(e.get("src_ip") or "").strip()
+        }
+    )
+    if h2_bomb_ips:
+        with connect() as conn:
+            http2_bomb_queued = _auto_enqueue_http2_bomb_mitigation(workspace_slug, conn, h2_bomb_ips)
     return {
         "accepted": accepted,
         "skipped": skipped,
@@ -5284,6 +5575,7 @@ def insert_security_events(workspace_slug: str, sensor_id: str, events: list[dic
         "latency_rows": latency_rows,
         "incident_result": incident_result,
         "pintheft_queued": pintheft_queued,
+        "http2_bomb_queued": http2_bomb_queued,
     }
 
 
@@ -5358,6 +5650,29 @@ def mythos_defense_summary(workspace_slug: str, hours: int = 24) -> dict:
             """,
             (workspace_slug,),
         ).fetchone()
+        h2_row = conn.execute(
+            """
+            SELECT
+              COUNT(*) AS events,
+              SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END) AS critical_events
+            FROM security_events
+            WHERE workspace_slug = ?
+              AND detected_at >= ?
+              AND (signature LIKE 'HTTP2-BOMB%' OR raw_event LIKE '%"http2_bomb_defense"%')
+            """,
+            (workspace_slug, since),
+        ).fetchone()
+        h2_block_row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM block_actions
+            WHERE workspace_slug = ?
+              AND target_type = 'ip'
+              AND reason LIKE 'HTTP2-BOMB%'
+              AND status IN ('pending','sent','applied')
+            """,
+            (workspace_slug,),
+        ).fetchone()
 
     suspected = int(row["suspected_ai_probe_events"] or 0) if row else 0
     chains = int(row["chain_events"] or 0) if row else 0
@@ -5380,6 +5695,13 @@ def mythos_defense_summary(workspace_slug: str, hours: int = 24) -> dict:
             "exposure_events": int(pin_row["exposure_events"] or 0) if pin_row else 0,
             "rds_load_events": int(pin_row["rds_load_events"] or 0) if pin_row else 0,
             "kernel_hardening_actions_active": int(hardening_row["c"] or 0) if hardening_row else 0,
+        },
+        "http2_bomb": {
+            "profile": "H2DP-001",
+            "cve": "CVE-2026-49975",
+            "events": int(h2_row["events"] or 0) if h2_row else 0,
+            "critical_events": int(h2_row["critical_events"] or 0) if h2_row else 0,
+            "ip_block_actions_active": int(h2_block_row["c"] or 0) if h2_block_row else 0,
         },
     }
     _MYTHOS_DEFENSE_SUMMARY_CACHE[cache_key] = (now_mono, dict(payload))

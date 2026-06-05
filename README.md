@@ -121,6 +121,7 @@ Redis 障害時は `IPS_REPLAY_FALLBACK_TO_MEMORY=1` の場合にメモリ退避
 |---|---|---|---|---|
 | IPROS-MDP | Mythos 型 AI-assisted exploit probe | — | High/Critical | 正規化 + 相関検知 + Canary + Evidence |
 | CVE-PENDING-PINTHEFT | PinTheft: Linux Kernel LPE via RDS zerocopy + io_uring | 7.8 | High | 検出 + センサー自動緩和 |
+| CVE-2026-49975 | HTTP/2 Bomb: HPACK 圧縮テーブル増幅 + Slowloris 型接続保持 (L7 DoS) | 7.5 | High | 検出 + 送信元IP自動緩和 |
 | CVE-2026-42945 | nginx Remote Code Execution | — | — | 検出 + パッチ推奨 |
 
 ---
@@ -176,6 +177,44 @@ CVSS:3.1/AV:L / AC:L / PR:L / UI:N / S:U / C:H / I:H / A:H
   センサー側で `IPS_ALLOW_KERNEL_HARDENING=1` かつ `IPS_APPLY_MODE=nft` のとき、modprobe ブラックリスト書き込みと `rmmod` を自動実行する。  
   WAF 無効状態でも緩和アクションは配信される（IP ブロックの WAF ゲートを迂回する専用パス）。
 - *監査*: 自動緩和キュー投入時に `policy_audit_logs` へ `kernel_hardening_queued` を記録する。
+
+---
+
+### CVE-2026-49975 — HTTP/2 Bomb (L7 DoS)
+
+**概要**  
+HTTP/2 の HPACK ヘッダ圧縮テーブルへ巨大なヘッダエントリを 1 件だけシードし、以降は
+そのエントリを指す 1 バイトのインデックス参照を数千個送り込むことで、サーバーに毎リクエストで
+巨大なヘッダ集合を再構成・保持させる。Slowloris 型に接続を保持し続けることでメモリを枯渇させる
+リモート DoS。認証不要で、単一クライアントが Apache httpd / Envoy に対し約 20 秒で 32GB を消費し得る。  
+nginx / Apache httpd / Microsoft IIS / Envoy / Cloudflare Pingora が影響を受ける。
+
+| 項目 | 内容 |
+|---|---|
+| **公表日** | 2026-06-03 (協調公開) |
+| **CVE ID** | CVE-2026-49975 |
+| **CVSS v3.1 スコア** | **7.5 (High)** |
+| **CVSS ベクター** | `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H` |
+| **影響** | 可用性のみ High（リモート DoS） |
+| **攻撃経路** | Network (AV:N) |
+| **必要な権限 / ユーザー操作** | 不要 (PR:N / UI:N) |
+| **影響を受ける構成** | HTTP/2 を有効化した nginx / Apache httpd / IIS / Envoy / Cloudflare Pingora |
+| **緩和策** | ヘッダ数・HPACK テーブルサイズの上限化、ベンダーパッチ適用、攻撃元の遮断 |
+
+**本 IPS での対応**
+
+- *検出*: センサーが報告する HTTP/2 テレメトリ（`header_count` / `hpack_indexed_ref_count` /
+  `largest_header_bytes` / `hpack_table_bytes` / `decoded_header_bytes` / `amplification_ratio` /
+  `connection_duration_sec` / `conn_mem_bytes`）から、`header_ref_flood`・`hpack_table_seeded`・
+  `decompression_amplification`・`memory_exhaustion`・`slowloris_hold` の各シグナルを判定する。
+  URI パターンではなくプロトコル挙動で検知するため、暗号化された正常リクエストに紛れた増幅攻撃も捕捉する。
+- *シグネチャ*: `HTTP2-BOMB-HPACK-001`（HPACK 増幅確定）/ `HTTP2-BOMB-SLOWLORIS-001`（保持型）/
+  `HTTP2-BOMB-001`（複合）/ `HTTP2-BOMB-SIGNAL-001`（単一シグナル）。プロファイル `H2DP-001`。
+  判定閾値は `IPS_H2_HEADER_COUNT_FLOOD` などの `IPS_H2_*` 環境変数で上書きできる。
+- *自動緩和*: 攻撃元 IP に対する `ip` ブロックアクションを WAF ゲートを尊重したうえでキューイング
+  （24 時間デデュプ）。投入時に `policy_audit_logs` へ `http2_bomb_mitigation_queued` を記録する。
+- *API*: `GET /api/v1/workspaces/{workspace}/mythos-defense/summary/` のレスポンスに
+  `http2_bomb` ロールアップ（events / critical_events / ip_block_actions_active）を含む。
 
 ---
 
